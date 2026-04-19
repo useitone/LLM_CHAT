@@ -4,6 +4,8 @@
 
 **Стек целевой разработки (по текущему плану):** Windows + Python; кроссплатформенность закладывается архитектурно.
 
+**Продолжить после нового чата:** [`docs/specs/handoff-todo.md`](docs/specs/handoff-todo.md) — нить разговора, решения и чеклисты.
+
 ## Структура
 
 | Папка | Назначение |
@@ -20,6 +22,7 @@
 - **`docs/neuroexperimenter/screenshots/`** — скриншоты интерфейса (`nex59_2_0.jpg` … `nex59_2_8.jpg`).
 - **`docs/sweep-tone-generator/SweepToneGenrator.md`** — конспект возможностей Tone Generator PRO (Android); скрины в **`docs/sweep-tone-generator/screenshots/`** (`tone-generator-pro-android-*.png`).
 - **`docs/specs/product-priorities.md`** — зафиксированные приоритеты: медитация/концентрация, графики ЭЭГ, развитие аудиомодуля по мотивам Sweep Tone Generator и агенты.
+- **`docs/specs/handoff-todo.md`** — TODO на будущее и напоминания после обновления чата.
 
 ## Что положить сюда
 
