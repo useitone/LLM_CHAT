@@ -1,0 +1,30 @@
+# Python (на будущее, когда появится код)
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Локальные секреты (API-ключи и т.д.)
+.env
+.env.*
+!.env.example
+
+# Крупные бинарники при необходимости раскомментировать:
+# *.edf
+# *.wav
