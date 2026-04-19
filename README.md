@@ -11,6 +11,7 @@
 | `docs/alisa-conversation/` | Экспорт переписки с AI Алиса (текст, Markdown или PDF) |
 | `docs/neuroexperimenter/` | Руководство пользователя NeuroExperimenter, скриншоты, заметки |
 | `docs/sweep-tone-generator/` | Скриншоты и описания приложения Sweep Tone Generator |
+| `docs/specs/` | Черновики ТЗ, приоритеты продукта, API, спецификации устройств |
 
 ### Сейчас в репозитории
 
@@ -18,7 +19,7 @@
 - **`docs/neuroexperimenter/NeuroExperimenter Users Guide.docx`** — официальное руководство пользователя NeuroExperimenter (текст и встроенные иллюстрации).
 - **`docs/neuroexperimenter/screenshots/`** — скриншоты интерфейса (`nex59_2_0.jpg` … `nex59_2_8.jpg`).
 - **`docs/sweep-tone-generator/SweepToneGenrator.md`** — конспект возможностей Tone Generator PRO (Android); скрины в **`docs/sweep-tone-generator/screenshots/`** (`tone-generator-pro-android-*.png`).
-| `docs/specs/` | Черновики ТЗ, API, спецификации устройств (по мере появления) |
+- **`docs/specs/product-priorities.md`** — зафиксированные приоритеты: медитация/концентрация, графики ЭЭГ, развитие аудиомодуля по мотивам Sweep Tone Generator и агенты.
 
 ## Что положить сюда
 
