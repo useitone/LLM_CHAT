@@ -40,6 +40,11 @@ from neurosync_pro.audio.engine import sine_pcm16_mono, write_wav_pcm16_mono
 from neurosync_pro.bus import EventBus
 from neurosync_pro.eeg.ble_stream import normalize_ble_address
 from neurosync_pro.ui.ble_thread import BleNotifyThread, BleScanThread
+try:  # optional audio extras
+    from neurosync_pro.audio.stream import StreamConfig, ToneSweepStream
+except Exception:  # pragma: no cover
+    StreamConfig = None  # type: ignore[misc,assignment]
+    ToneSweepStream = None  # type: ignore[misc,assignment]
 
 
 def _iter_eeg(path: Path) -> Iterator[tuple[int, int]]:
@@ -140,6 +145,20 @@ class MeditationMainWindow(QMainWindow):
         self._last_med = 0
         self._ble_selected_rssi: int | None = None
 
+        # EEG → Tone (audio biofeedback)
+        self._eeg_tone_available = ToneSweepStream is not None
+        self._eeg_tone_enabled = False
+        self._eeg_tone_stream = None
+        self._eeg_tone_min_hz = 100.0
+        self._eeg_tone_max_hz = 1000.0
+        self._eeg_tone_min_vol = 0.02
+        self._eeg_tone_max_vol = 0.20
+        self._eeg_tone_alpha = 0.18  # EMA smoothing
+        self._eeg_tone_f_hz = 440.0
+        self._eeg_tone_vol = 0.0
+        self._eeg_tone_last_apply = 0.0
+        self._eeg_tone_apply_min_s = 0.10  # 10 Hz
+
         # Link/quality stats (session time, Hz, last sample age).
         self._session_started_at: float | None = None
         self._last_metric_at: float | None = None
@@ -231,6 +250,12 @@ class MeditationMainWindow(QMainWindow):
             self._session_btn.setEnabled(False)
             self._session_btn.setToolTip("Для фиксированного --session-log новая сессия не создаётся (append).")
 
+        self._eeg_tone_cb = QCheckBox("EEG → Tone (A=частота, M=громкость)")
+        self._eeg_tone_cb.setEnabled(self._eeg_tone_available)
+        if not self._eeg_tone_available:
+            self._eeg_tone_cb.setToolTip("Установите audio extras: pip install -e \".[audio]\"")
+        self._eeg_tone_cb.toggled.connect(self._toggle_eeg_tone)
+
         # BLE scan controls (when address not passed explicitly).
         self._ble_scan_btn = QPushButton("Сканировать BrainLink")
         self._ble_scan_btn.clicked.connect(self._scan_ble)
@@ -260,6 +285,7 @@ class MeditationMainWindow(QMainWindow):
         sess_lay.addWidget(self._record_btn)
         sess_lay.addStretch(1)
         lay.addWidget(sess_row)
+        lay.addWidget(self._eeg_tone_cb)
         plot_row = QWidget()
         plot_row_lay = QHBoxLayout(plot_row)
         plot_row_lay.setContentsMargins(0, 0, 0, 0)
@@ -311,6 +337,35 @@ class MeditationMainWindow(QMainWindow):
         if auto_start_ble and self._ble_address:
             QTimer.singleShot(300, self._start_ble)
         self._stats_timer.start()
+
+    def _toggle_eeg_tone(self, on: bool) -> None:
+        self._eeg_tone_enabled = bool(on)
+        if not self._eeg_tone_enabled:
+            self._stop_eeg_tone()
+
+    def _ensure_eeg_tone_stream(self) -> bool:
+        if not self._eeg_tone_available:
+            return False
+        if self._eeg_tone_stream is None:
+            try:
+                self._eeg_tone_stream = ToneSweepStream(StreamConfig(sample_rate=48000))
+                self._eeg_tone_stream.set_fades(0.02, 0.08)
+                self._eeg_tone_stream.start()
+            except Exception as exc:
+                self._status.setText(f"Audio ошибка: {exc}")
+                self._eeg_tone_stream = None
+                self._eeg_tone_cb.setChecked(False)
+                return False
+        return True
+
+    def _stop_eeg_tone(self) -> None:
+        st = self._eeg_tone_stream
+        self._eeg_tone_stream = None
+        if st is not None:
+            try:
+                st.stop()
+            except Exception:
+                pass
 
     def _toggle_recording(self, on: bool) -> None:
         self._session_log_active = bool(on)
@@ -599,6 +654,7 @@ class MeditationMainWindow(QMainWindow):
         self._bus.publish("eeg.metrics", {"attention": att, "meditation": med})
         self._append_session_log(att, med)
         self._append_plot_point(att, med)
+        self._apply_eeg_tone()
         if self._status.text().startswith("BLE: подключение"):
             self._status.setText("BLE: поток активен")
 
@@ -658,10 +714,12 @@ class MeditationMainWindow(QMainWindow):
         self._bus.publish("eeg.metrics", {"attention": att, "meditation": med})
         self._append_session_log(att, med)
         self._append_plot_point(att, med)
+        self._apply_eeg_tone()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self._bio_timer.stop()
         self._stats_timer.stop()
+        self._stop_eeg_tone()
         if self._ble_scan_thread is not None and self._ble_scan_thread.isRunning():
             self._ble_scan_thread.wait(2000)
             self._ble_scan_thread = None
@@ -712,6 +770,39 @@ class MeditationMainWindow(QMainWindow):
             parts.append(f"RSSI {self._ble_selected_rssi}")
 
         self._stats.setText(" · ".join(parts))
+
+    def _apply_eeg_tone(self) -> None:
+        if not self._eeg_tone_enabled:
+            return
+        now = time.monotonic()
+        if now - self._eeg_tone_last_apply < self._eeg_tone_apply_min_s:
+            return
+        self._eeg_tone_last_apply = now
+
+        # Failsafe: if data is stale, fade volume down and stop.
+        if self._last_metric_at is None or (now - self._last_metric_at) > 3.0:
+            self._eeg_tone_vol = self._eeg_tone_vol * (1.0 - self._eeg_tone_alpha)
+            if self._eeg_tone_vol < 0.005:
+                self._stop_eeg_tone()
+            else:
+                if self._ensure_eeg_tone_stream():
+                    self._eeg_tone_stream.set_volume(float(self._eeg_tone_vol))
+            return
+
+        # Map metrics.
+        att = float(self._last_att) / 100.0
+        med = float(self._last_med) / 100.0
+        target_f = self._eeg_tone_min_hz + (self._eeg_tone_max_hz - self._eeg_tone_min_hz) * att
+        target_v = self._eeg_tone_min_vol + (self._eeg_tone_max_vol - self._eeg_tone_min_vol) * med
+
+        a = self._eeg_tone_alpha
+        self._eeg_tone_f_hz = (1.0 - a) * self._eeg_tone_f_hz + a * target_f
+        self._eeg_tone_vol = (1.0 - a) * self._eeg_tone_vol + a * target_v
+
+        if not self._ensure_eeg_tone_stream():
+            return
+        self._eeg_tone_stream.set_volume(float(self._eeg_tone_vol))
+        self._eeg_tone_stream.play_tone(float(self._eeg_tone_f_hz))
 
 
 def run_meditation_poc(
