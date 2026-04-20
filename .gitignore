@@ -20,8 +20,17 @@ build/
 .DS_Store
 Thumbs.db
 
+# Локальные дампы/сессии (для репо оставляем только код и docs-спеки).
+docs/specs/sessions/
+docs/specs/*.json
+docs/specs/*.jsonl
+
 # Локальный клон сторонних репо для разбора (см. docs/specs/vendor/README.md)
 docs/specs/vendor/brainlink_parser_linux/
+
+# Целиком игнорируем vendor и снапшоты стороннего pybrainlink (не часть продукта).
+docs/specs/vendor/
+docs/specs/pybrainlink-0.3.0/
 
 # Закрытый модуль Macrotellect (кладётся вручную, см. vendor/macrotellect_brainlink_parser/README.md)
 docs/specs/vendor/macrotellect_brainlink_parser/*.pyd

@@ -30,6 +30,7 @@
 - COM + **официальный** Macrotellect `BrainLinkParser.pyd`: `scripts/brainlink_com_macrotellect.py` → `docs/specs/brainlink-com-macrotellect.jsonl` (нужен ручной копи `.pyd`, см. `docs/specs/vendor/macrotellect_brainlink_parser/README.md`).
 - **Один прогон COM+BLE** (перекрывающийся UTC для compare): `scripts/brainlink_concurrent_capture.py` — см. `brainlink-protocol-notes.md` §15; оркестратор (chdir + compare + сводка в консоль): `scripts/brainlink_verify_one_session.py` — §16.
 - **Live BLE в PoC медитации:** `neurosync-pro meditation --ble-address …` (опции `--ble-init-hex`, `--ble-duration`, `--session-log`); модули `neurosync_pro.eeg.live_decode`, `neurosync_pro.eeg.ble_stream`, `neurosync_pro.ui.ble_thread`; биофидбэк-тон в UI (чекбокс).
+- **Зафиксированный статус EEG MVP:** `docs/specs/eeg-mvp-status.md` (архитектура, команды, формат логов, критерии стабильности).
 
 ## TODO — пользователю
 
@@ -49,7 +50,7 @@
 
 - [x] **MVP на BLE:** живой BLE → парсер → `meditation` PoC + шина (`eeg.metrics`); кнопки Старт/Стоп BLE, автостарт при передаче `--ble-address` из CLI.
 - [x] **Аудио в сессии (черновик):** чекбокс «Тон обратной связи» — краткий синус, частота ~ Attention, громкость ~ Meditation (`neurosync_pro.audio.engine`); смена фазы по-прежнему со звуком.
-- [ ] **Критерий готовности чернового MVP:** проверить на железе **10–15 мин** стабильной сессии, без зависаний при отключении; при необходимости доработать UX/индикаторы.
+- [x] **Критерий готовности чернового MVP:** проверено на железе ~10–15 мин: стабильный поток, график, скан в UI, лог‑сессии, кнопки Stop/Close отрабатывают; при необходимости — дальнейшие UX‑улучшения.
 - [x] Опциональный **лог сессии JSONL** (`--session-log`, строки `type=eeg` как в дампах для replay).
 - [x] Создать структуру Python-проекта: `pyproject.toml`, пакет `src/neurosync_pro/` (`eeg/`, `audio/`, CLI `neurosync-pro`). Установка: `pip install -e ".[dev]"` из корня репозитория.
 - [x] Модуль **ЭЭГ** (разбор кадров): `neurosync_pro.eeg.protocol`, тесты `tests/test_eeg_protocol.py`; визуализация — `pip install -e ".[gui]"` → `neurosync-pro eeg-replay --input …jsonl`.
