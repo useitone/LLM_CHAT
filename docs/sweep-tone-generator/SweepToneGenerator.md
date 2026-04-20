@@ -1,5 +1,31 @@
 Tone Generator PRO – генератор тона развертки (линейный или логарифмический для музыкантов).
 
+## MVP в NeuroSync Pro (Windows, realtime)
+
+На текущем этапе в NeuroSync Pro реализован минимальный realtime‑скелет под Windows:
+
+- `neurosync-pro tone` — непрерывный тон
+- `neurosync-pro sweep` — sweep (linear/log), loop, fade in/out
+- `neurosync-pro sweep-ui` — простое окно управления tone/sweep
+
+Установка:
+
+```bash
+pip install -e ".[audio]"
+pip install -e ".[gui]"
+```
+
+Примеры:
+
+```bash
+neurosync-pro tone --freq 440 --duration 2
+neurosync-pro sweep --f0 200 --f1 1000 --duration 10
+neurosync-pro sweep --f0 100 --f1 8000 --duration 30 --log --loop
+neurosync-pro sweep-ui
+```
+
+## Ориентир по функциям (из Tone Generator PRO)
+
 Возможности:
 
 Тон-генератор

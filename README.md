@@ -28,6 +28,7 @@
 pip install -e ".[dev]"
 neurosync-pro --help
 pip install -e ".[gui]"   # PySide6: eeg-replay, meditation
+pip install -e ".[audio]" # sounddevice + numpy: realtime tone/sweep
 neurosync-pro meditation --ble-address "C0:E2:FC:2D:AC:10" --session-log docs/specs/meditation-session.jsonl
 neurosync-pro meditation --input docs/specs/one-session-ble.jsonl
 neurosync-pro decode --input docs/specs/brainlink-raw-capture.jsonl
@@ -35,6 +36,9 @@ neurosync-pro compare
 neurosync-pro concurrent-capture --address "C0:E2:FC:2D:AC:10" --stem docs/specs/brainlink-concurrent-session
 neurosync-pro agent-serve
 python scripts/brainlink_verify_one_session.py --summary
+neurosync-pro tone --freq 440 --duration 2
+neurosync-pro sweep --f0 200 --f1 1000 --duration 10
+neurosync-pro sweep-ui
 ```
 
 ### Сейчас в репозитории

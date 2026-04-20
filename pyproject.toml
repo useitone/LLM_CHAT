@@ -21,6 +21,10 @@ dev = [
 gui = [
     "PySide6>=6.5.0",
 ]
+audio = [
+    "numpy>=1.24",
+    "sounddevice>=0.4.6",
+]
 
 [project.scripts]
 neurosync-pro = "neurosync_pro.cli:main"

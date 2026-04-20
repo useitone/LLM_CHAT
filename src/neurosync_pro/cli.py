@@ -133,6 +133,62 @@ def cmd_meditation(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_sweep_ui(_args: argparse.Namespace) -> int:
+    try:
+        from neurosync_pro.ui.sweep_tone import run_sweep_tone_ui
+    except ImportError as e:
+        print("Install GUI extras: pip install -e \".[gui]\"", file=sys.stderr)
+        print(e, file=sys.stderr)
+        return 1
+    return run_sweep_tone_ui()
+
+
+def cmd_tone(args: argparse.Namespace) -> int:
+    from neurosync_pro.audio.stream import StreamConfig, ToneSweepStream
+
+    s = ToneSweepStream(StreamConfig(sample_rate=int(args.sample_rate)))
+    s.set_volume(float(args.volume))
+    s.set_fades(float(args.fade_in), float(args.fade_out))
+    s.start()
+    s.play_tone(float(args.freq))
+    try:
+        import time
+
+        time.sleep(float(args.duration))
+    finally:
+        s.stop()
+    return 0
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    from neurosync_pro.audio.stream import StreamConfig, ToneSweepStream
+
+    s = ToneSweepStream(StreamConfig(sample_rate=int(args.sample_rate)))
+    s.set_volume(float(args.volume))
+    s.set_fades(float(args.fade_in), float(args.fade_out))
+    s.start()
+    s.play_sweep(
+        f0_hz=float(args.f0),
+        f1_hz=float(args.f1),
+        duration_s=float(args.duration),
+        log=bool(args.log),
+        loop=bool(args.loop),
+    )
+    try:
+        import time
+
+        if args.loop:
+            while True:
+                time.sleep(1.0)
+        else:
+            time.sleep(float(args.duration) + float(args.fade_out) + 0.05)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        s.stop()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="neurosync-pro",
@@ -253,6 +309,30 @@ def build_parser() -> argparse.ArgumentParser:
     ag.add_argument("--host", default="127.0.0.1")
     ag.add_argument("--port", type=int, default=8765)
     ag.set_defaults(func=cmd_agent_serve)
+
+    t = sub.add_parser("tone", help="Realtime tone via sounddevice (Windows MVP).")
+    t.add_argument("--freq", type=float, default=440.0)
+    t.add_argument("--duration", type=float, default=3.0)
+    t.add_argument("--volume", type=float, default=0.15)
+    t.add_argument("--sample-rate", type=int, default=48000)
+    t.add_argument("--fade-in", type=float, default=0.02)
+    t.add_argument("--fade-out", type=float, default=0.05)
+    t.set_defaults(func=cmd_tone)
+
+    sw = sub.add_parser("sweep", help="Realtime sweep via sounddevice (Windows MVP).")
+    sw.add_argument("--f0", type=float, default=200.0)
+    sw.add_argument("--f1", type=float, default=1000.0)
+    sw.add_argument("--duration", type=float, default=10.0)
+    sw.add_argument("--log", action="store_true", help="Use logarithmic sweep.")
+    sw.add_argument("--loop", action="store_true", help="Loop sweep until Ctrl+C.")
+    sw.add_argument("--volume", type=float, default=0.15)
+    sw.add_argument("--sample-rate", type=int, default=48000)
+    sw.add_argument("--fade-in", type=float, default=0.02)
+    sw.add_argument("--fade-out", type=float, default=0.05)
+    sw.set_defaults(func=cmd_sweep)
+
+    sui = sub.add_parser("sweep-ui", help="GUI tone/sweep generator (requires .[gui] and .[audio]).")
+    sui.set_defaults(func=cmd_sweep_ui)
 
     return p
 
