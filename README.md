@@ -57,3 +57,7 @@ python scripts/brainlink_verify_one_session.py --summary
 ## Лицензия
 
 Материалы в `docs/` могут быть под разными правами; код проекта при появлении — см. корневой `LICENSE`.
+
+## Contributors
+
+См. [`CONTRIBUTORS.md`](CONTRIBUTORS.md).
