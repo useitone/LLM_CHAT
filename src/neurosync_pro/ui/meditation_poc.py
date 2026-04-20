@@ -135,6 +135,7 @@ class MeditationMainWindow(QMainWindow):
         self._ble_scan_thread: BleScanThread | None = None
         self._session_log_path = session_log_path
         self._session_log_file: TextIOBase | None = None
+        self._session_log_active = session_log_path is not None
         self._last_att = 0
         self._last_med = 0
 
@@ -161,6 +162,7 @@ class MeditationMainWindow(QMainWindow):
 
         if session_log_path is not None:
             session_log_path.parent.mkdir(parents=True, exist_ok=True)
+            # CLI-provided log path: keep append semantics (explicit user choice).
             self._session_log_file = session_log_path.open("a", encoding="utf-8")
 
         cw = QWidget()
@@ -207,6 +209,19 @@ class MeditationMainWindow(QMainWindow):
         self._bio_timer.setInterval(700)
         self._bio_timer.timeout.connect(self._biofeedback_tick)
 
+        # Session logging controls (new session file per run; avoids append confusion).
+        self._session_btn = QPushButton("Новая сессия (лог)")
+        self._session_btn.clicked.connect(self._new_session_log)
+        self._record_btn = QPushButton("Запись: Вкл")
+        self._record_btn.setCheckable(True)
+        self._record_btn.setChecked(self._session_log_active)
+        self._record_btn.toggled.connect(self._toggle_recording)
+        if not self._session_log_active:
+            self._record_btn.setText("Запись: Выкл")
+        if self._session_log_path is not None:
+            self._session_btn.setEnabled(False)
+            self._session_btn.setToolTip("Для фиксированного --session-log новая сессия не создаётся (append).")
+
         # BLE scan controls (when address not passed explicitly).
         self._ble_scan_btn = QPushButton("Сканировать BrainLink")
         self._ble_scan_btn.clicked.connect(self._scan_ble)
@@ -227,6 +242,13 @@ class MeditationMainWindow(QMainWindow):
         lay.addWidget(QLabel("Метрики:"))
         lay.addWidget(self._att)
         lay.addWidget(self._med)
+        sess_row = QWidget()
+        sess_lay = QHBoxLayout(sess_row)
+        sess_lay.setContentsMargins(0, 0, 0, 0)
+        sess_lay.addWidget(self._session_btn)
+        sess_lay.addWidget(self._record_btn)
+        sess_lay.addStretch(1)
+        lay.addWidget(sess_row)
         plot_row = QWidget()
         plot_row_lay = QHBoxLayout(plot_row)
         plot_row_lay.setContentsMargins(0, 0, 0, 0)
@@ -277,6 +299,43 @@ class MeditationMainWindow(QMainWindow):
 
         if auto_start_ble and self._ble_address:
             QTimer.singleShot(300, self._start_ble)
+
+    def _toggle_recording(self, on: bool) -> None:
+        self._session_log_active = bool(on)
+        self._record_btn.setText("Запись: Вкл" if self._session_log_active else "Запись: Выкл")
+        if not self._session_log_active:
+            if self._session_log_file is not None:
+                try:
+                    self._session_log_file.close()
+                except OSError:
+                    pass
+                self._session_log_file = None
+
+    def _default_session_log_path(self) -> Path:
+        ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        root = Path.cwd()
+        return root / "docs" / "specs" / "sessions" / f"meditation_{ts}.jsonl"
+
+    def _new_session_log(self) -> None:
+        # Rotate to a new timestamped file. Enable recording automatically.
+        if self._session_log_path is not None:
+            self._status.setText(f"Лог фиксирован CLI: {self._session_log_path}")
+            return
+
+        if self._session_log_file is not None:
+            try:
+                self._session_log_file.close()
+            except OSError:
+                pass
+            self._session_log_file = None
+
+        path = self._default_session_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._session_log_file = path.open("w", encoding="utf-8")
+        self._status.setText(f"Лог сессии: {path}")
+
+        if not self._session_log_active:
+            self._record_btn.setChecked(True)
 
     def _scan_ble(self) -> None:
         if self._ble_scan_thread is not None and self._ble_scan_thread.isRunning():
@@ -458,9 +517,19 @@ class MeditationMainWindow(QMainWindow):
         _play_brief_pitch_hz(freq, vol)
 
     def _append_session_log(self, att: int, med: int) -> None:
-        fp = self._session_log_file
-        if fp is None:
+        if not self._session_log_active:
             return
+        fp = self._session_log_file
+        if fp is None and self._session_log_path is not None:
+            self._session_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._session_log_file = self._session_log_path.open("a", encoding="utf-8")
+            fp = self._session_log_file
+        if fp is None and self._session_log_path is None:
+            # Lazy-create first session log on demand.
+            self._new_session_log()
+            fp = self._session_log_file
+            if fp is None:
+                return
         rec = {
             "type": "eeg",
             "timestamp_utc": datetime.now(UTC).isoformat(),
