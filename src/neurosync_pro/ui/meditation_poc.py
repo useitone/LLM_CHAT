@@ -143,6 +143,9 @@ class MeditationMainWindow(QMainWindow):
         self._t = deque(maxlen=2000)  # seconds since start
         self._att_hist = deque(maxlen=2000)
         self._med_hist = deque(maxlen=2000)
+        self._plot_dirty = False
+        self._plot_last_redraw = 0.0
+        self._plot_min_redraw_s = 0.15  # ~6-7 FPS max
         self._series_att = None
         self._series_med = None
         self._axis_x = None
@@ -188,6 +191,13 @@ class MeditationMainWindow(QMainWindow):
         if not self._plot_available:
             self._plot_cb.setToolTip("PySide6.QtCharts недоступен в текущей установке.")
         self._plot_cb.toggled.connect(self._toggle_plot)
+        self._plot_clear_btn = QPushButton("Очистить график")
+        self._plot_clear_btn.setEnabled(self._plot_available)
+        self._plot_clear_btn.clicked.connect(self._clear_plot)
+        self._plot_clear_btn.setVisible(False)
+        self._plot_timer = QTimer(self)
+        self._plot_timer.setInterval(120)
+        self._plot_timer.timeout.connect(self._plot_tick)
 
         self._bio_cb = QCheckBox("Тон обратной связи (высота ~ Attention, громкость ~ Meditation)")
         self._bio_timer = QTimer(self)
@@ -206,7 +216,13 @@ class MeditationMainWindow(QMainWindow):
         lay.addWidget(QLabel("Метрики:"))
         lay.addWidget(self._att)
         lay.addWidget(self._med)
-        lay.addWidget(self._plot_cb)
+        plot_row = QWidget()
+        plot_row_lay = QHBoxLayout(plot_row)
+        plot_row_lay.setContentsMargins(0, 0, 0, 0)
+        plot_row_lay.addWidget(self._plot_cb)
+        plot_row_lay.addStretch(1)
+        plot_row_lay.addWidget(self._plot_clear_btn)
+        lay.addWidget(plot_row)
         if self._plot_available:
             self._init_plot_widgets(lay)
         if self._ble_address:
@@ -244,8 +260,23 @@ class MeditationMainWindow(QMainWindow):
         self._plot_enabled = bool(on)
         if self._chart_view is not None:
             self._chart_view.setVisible(self._plot_enabled)
+        self._plot_clear_btn.setVisible(self._plot_enabled)
+        if self._plot_enabled:
+            self._plot_timer.start()
+        else:
+            self._plot_timer.stop()
         if self._plot_enabled:
             self._refresh_plot(force=True)
+
+    def _plot_tick(self) -> None:
+        if not self._plot_enabled or not self._plot_dirty:
+            return
+        now = time.monotonic()
+        if now - self._plot_last_redraw < self._plot_min_redraw_s:
+            return
+        self._plot_last_redraw = now
+        self._plot_dirty = False
+        self._refresh_plot()
 
     def _init_plot_widgets(self, lay: QVBoxLayout) -> None:
         if not self._plot_available:
@@ -295,6 +326,22 @@ class MeditationMainWindow(QMainWindow):
         self._t.append(t)
         self._att_hist.append(att)
         self._med_hist.append(med)
+        self._plot_dirty = True
+
+    def _clear_plot(self) -> None:
+        if not self._plot_available:
+            return
+        self._t0 = time.monotonic()
+        self._t.clear()
+        self._att_hist.clear()
+        self._med_hist.clear()
+        self._plot_dirty = True
+        if self._series_att is not None:
+            self._series_att.clear()
+        if self._series_med is not None:
+            self._series_med.clear()
+        if self._axis_x is not None:
+            self._axis_x.setRange(0, self._plot_window_s)
 
     def _refresh_plot(self, *, force: bool = False) -> None:
         if not self._plot_available or not self._plot_enabled:
@@ -381,7 +428,6 @@ class MeditationMainWindow(QMainWindow):
         self._bus.publish("eeg.metrics", {"attention": att, "meditation": med})
         self._append_session_log(att, med)
         self._append_plot_point(att, med)
-        self._refresh_plot()
         if self._status.text().startswith("BLE: подключение"):
             self._status.setText("BLE: поток активен")
 
@@ -436,7 +482,6 @@ class MeditationMainWindow(QMainWindow):
         self._bus.publish("eeg.metrics", {"attention": att, "meditation": med})
         self._append_session_log(att, med)
         self._append_plot_point(att, med)
-        self._refresh_plot()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self._bio_timer.stop()
