@@ -138,6 +138,15 @@ class MeditationMainWindow(QMainWindow):
         self._session_log_active = session_log_path is not None
         self._last_att = 0
         self._last_med = 0
+        self._ble_selected_rssi: int | None = None
+
+        # Link/quality stats (session time, Hz, last sample age).
+        self._session_started_at: float | None = None
+        self._last_metric_at: float | None = None
+        self._metric_times = deque(maxlen=5000)
+        self._stats_timer = QTimer(self)
+        self._stats_timer.setInterval(1000)
+        self._stats_timer.timeout.connect(self._update_stats_line)
 
         # Simple rolling metrics plot (optional, requires PySide6.QtCharts).
         self._plot_available = QChart is not None
@@ -237,8 +246,10 @@ class MeditationMainWindow(QMainWindow):
         self._ble_start.setEnabled(bool(self._ble_address))
 
         self._status = QLabel("")
+        self._stats = QLabel("")
         lay.addWidget(self._hint)
         lay.addWidget(self._src_label)
+        lay.addWidget(self._stats)
         lay.addWidget(QLabel("Метрики:"))
         lay.addWidget(self._att)
         lay.addWidget(self._med)
@@ -299,6 +310,7 @@ class MeditationMainWindow(QMainWindow):
 
         if auto_start_ble and self._ble_address:
             QTimer.singleShot(300, self._start_ble)
+        self._stats_timer.start()
 
     def _toggle_recording(self, on: bool) -> None:
         self._session_log_active = bool(on)
@@ -362,7 +374,10 @@ class MeditationMainWindow(QMainWindow):
             addr = normalize_ble_address(str(r.get("address") or ""))
             rssi = r.get("rssi")
             extra = f"  RSSI={rssi}" if rssi is not None else ""
-            self._ble_devices.addItem(f"{name} ({addr}){extra}", userData=addr)
+            self._ble_devices.addItem(
+                f"{name} ({addr}){extra}",
+                userData={"address": addr, "rssi": rssi, "name": name},
+            )
         self._ble_devices.setEnabled(True)
         self._status.setText("BLE: выберите устройство и нажмите «Старт BLE»")
         self._select_ble_device(self._ble_devices.currentIndex())
@@ -378,8 +393,17 @@ class MeditationMainWindow(QMainWindow):
             self._ble_start.setEnabled(False)
             self._src_label.setText("ЭЭГ: нет (только фазы дыхания)")
             return
-        addr = self._ble_devices.itemData(idx)
-        addr_s = normalize_ble_address(str(addr or ""))
+        data = self._ble_devices.itemData(idx)
+        if isinstance(data, dict):
+            addr_s = normalize_ble_address(str(data.get("address") or ""))
+            rssi = data.get("rssi")
+            try:
+                self._ble_selected_rssi = int(rssi) if rssi is not None else None
+            except (TypeError, ValueError):
+                self._ble_selected_rssi = None
+        else:
+            addr_s = normalize_ble_address(str(data or ""))
+            self._ble_selected_rssi = None
         self._ble_address = addr_s or None
         if self._ble_address:
             self._src_label.setText(f"BLE: {self._ble_address}")
@@ -544,6 +568,9 @@ class MeditationMainWindow(QMainWindow):
         self._status.setText("BLE: подключение…")
         self._ble_start.setEnabled(False)
         self._ble_stop.setEnabled(True)
+        self._session_started_at = time.monotonic()
+        self._last_metric_at = None
+        self._metric_times.clear()
         th = BleNotifyThread(
             self._ble_address,
             init_hex=self._ble_init_hex,
@@ -562,6 +589,9 @@ class MeditationMainWindow(QMainWindow):
             self._status.setText("BLE: остановка…")
 
     def _on_ble_metrics(self, att: int, med: int) -> None:
+        now = time.monotonic()
+        self._last_metric_at = now
+        self._metric_times.append(now)
         self._last_att = att
         self._last_med = med
         self._att.setValue(att)
@@ -616,6 +646,11 @@ class MeditationMainWindow(QMainWindow):
         except StopIteration:
             self._eeg_timer.stop()
             return
+        now = time.monotonic()
+        if self._session_started_at is None:
+            self._session_started_at = now
+        self._last_metric_at = now
+        self._metric_times.append(now)
         self._last_att = att
         self._last_med = med
         self._att.setValue(att)
@@ -626,6 +661,7 @@ class MeditationMainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self._bio_timer.stop()
+        self._stats_timer.stop()
         if self._ble_scan_thread is not None and self._ble_scan_thread.isRunning():
             self._ble_scan_thread.wait(2000)
             self._ble_scan_thread = None
@@ -643,6 +679,39 @@ class MeditationMainWindow(QMainWindow):
                 pass
             self._session_log_file = None
         super().closeEvent(event)
+
+    def _update_stats_line(self) -> None:
+        # Show: session time, update rate, last sample age, plus RSSI if known.
+        now = time.monotonic()
+        parts: list[str] = []
+        if self._session_started_at is not None:
+            elapsed = max(0.0, now - self._session_started_at)
+            mm = int(elapsed // 60)
+            ss = int(elapsed % 60)
+            parts.append(f"⏱ {mm:02d}:{ss:02d}")
+
+        # Hz over last 10 seconds.
+        hz = None
+        if self._metric_times:
+            cutoff = now - 10.0
+            n = 0
+            for t in reversed(self._metric_times):
+                if t < cutoff:
+                    break
+                n += 1
+            hz = n / 10.0
+            parts.append(f"{hz:.1f} Hz")
+
+        if self._last_metric_at is not None:
+            age = now - self._last_metric_at
+            parts.append(f"last {age:.1f}s")
+            if age > 3.0 and (self._ble_thread is not None):
+                parts.append("нет данных?")
+
+        if self._ble_selected_rssi is not None:
+            parts.append(f"RSSI {self._ble_selected_rssi}")
+
+        self._stats.setText(" · ".join(parts))
 
 
 def run_meditation_poc(
