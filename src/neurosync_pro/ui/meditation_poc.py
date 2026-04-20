@@ -20,6 +20,7 @@ from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -37,7 +38,8 @@ except Exception:  # pragma: no cover - optional addon
 from neurosync_pro.agent.server import start_agent_api, stop_agent_api
 from neurosync_pro.audio.engine import sine_pcm16_mono, write_wav_pcm16_mono
 from neurosync_pro.bus import EventBus
-from neurosync_pro.ui.ble_thread import BleNotifyThread
+from neurosync_pro.eeg.ble_stream import normalize_ble_address
+from neurosync_pro.ui.ble_thread import BleNotifyThread, BleScanThread
 
 
 def _iter_eeg(path: Path) -> Iterator[tuple[int, int]]:
@@ -130,6 +132,7 @@ class MeditationMainWindow(QMainWindow):
         self._ble_init_hex = ble_init_hex
         self._ble_duration_s = ble_duration_s
         self._ble_thread: BleNotifyThread | None = None
+        self._ble_scan_thread: BleScanThread | None = None
         self._session_log_path = session_log_path
         self._session_log_file: TextIOBase | None = None
         self._last_att = 0
@@ -204,11 +207,19 @@ class MeditationMainWindow(QMainWindow):
         self._bio_timer.setInterval(700)
         self._bio_timer.timeout.connect(self._biofeedback_tick)
 
+        # BLE scan controls (when address not passed explicitly).
+        self._ble_scan_btn = QPushButton("Сканировать BrainLink")
+        self._ble_scan_btn.clicked.connect(self._scan_ble)
+        self._ble_devices = QComboBox()
+        self._ble_devices.setEnabled(False)
+        self._ble_devices.currentIndexChanged.connect(self._select_ble_device)
+
         self._ble_start = QPushButton("Старт BLE")
         self._ble_stop = QPushButton("Стоп BLE")
         self._ble_stop.setEnabled(False)
         self._ble_start.clicked.connect(self._start_ble)
         self._ble_stop.clicked.connect(self._stop_ble)
+        self._ble_start.setEnabled(bool(self._ble_address))
 
         self._status = QLabel("")
         lay.addWidget(self._hint)
@@ -232,6 +243,19 @@ class MeditationMainWindow(QMainWindow):
             h.addWidget(self._ble_start)
             h.addWidget(self._ble_stop)
             lay.addWidget(row)
+        else:
+            scan_row = QWidget()
+            sh = QHBoxLayout(scan_row)
+            sh.setContentsMargins(0, 0, 0, 0)
+            sh.addWidget(self._ble_scan_btn)
+            sh.addWidget(self._ble_devices, 1)
+            lay.addWidget(scan_row)
+            btn_row = QWidget()
+            bh = QHBoxLayout(btn_row)
+            bh.setContentsMargins(0, 0, 0, 0)
+            bh.addWidget(self._ble_start)
+            bh.addWidget(self._ble_stop)
+            lay.addWidget(btn_row)
         lay.addWidget(self._bio_cb)
         self._bio_cb.toggled.connect(self._toggle_biofeedback)
         lay.addWidget(self._api_cb)
@@ -253,6 +277,54 @@ class MeditationMainWindow(QMainWindow):
 
         if auto_start_ble and self._ble_address:
             QTimer.singleShot(300, self._start_ble)
+
+    def _scan_ble(self) -> None:
+        if self._ble_scan_thread is not None and self._ble_scan_thread.isRunning():
+            return
+        self._status.setText("BLE: сканирование…")
+        self._ble_scan_btn.setEnabled(False)
+        self._ble_devices.clear()
+        self._ble_devices.setEnabled(False)
+        th = BleScanThread(scan_time_s=12.0, name_filter="BrainLink", parent=self)
+        th.scanResult.connect(self._on_scan_result)
+        th.scanFailed.connect(self._on_scan_failed)
+        self._ble_scan_thread = th
+        th.start()
+
+    def _on_scan_result(self, rows: list) -> None:
+        self._ble_scan_btn.setEnabled(True)
+        self._ble_devices.clear()
+        if not rows:
+            self._status.setText("BLE: ничего не найдено (включите гарнитуру/видимость и повторите)")
+            self._ble_devices.setEnabled(False)
+            return
+        for r in rows:
+            name = r.get("name") or "Unknown"
+            addr = normalize_ble_address(str(r.get("address") or ""))
+            rssi = r.get("rssi")
+            extra = f"  RSSI={rssi}" if rssi is not None else ""
+            self._ble_devices.addItem(f"{name} ({addr}){extra}", userData=addr)
+        self._ble_devices.setEnabled(True)
+        self._status.setText("BLE: выберите устройство и нажмите «Старт BLE»")
+        self._select_ble_device(self._ble_devices.currentIndex())
+
+    def _on_scan_failed(self, msg: str) -> None:
+        self._ble_scan_btn.setEnabled(True)
+        self._ble_devices.setEnabled(False)
+        self._status.setText(f"BLE scan ошибка: {msg}")
+
+    def _select_ble_device(self, idx: int) -> None:
+        if idx < 0:
+            self._ble_address = None
+            self._ble_start.setEnabled(False)
+            self._src_label.setText("ЭЭГ: нет (только фазы дыхания)")
+            return
+        addr = self._ble_devices.itemData(idx)
+        addr_s = normalize_ble_address(str(addr or ""))
+        self._ble_address = addr_s or None
+        if self._ble_address:
+            self._src_label.setText(f"BLE: {self._ble_address}")
+            self._ble_start.setEnabled(True)
 
     def _toggle_plot(self, on: bool) -> None:
         if not self._plot_available:
@@ -485,6 +557,9 @@ class MeditationMainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self._bio_timer.stop()
+        if self._ble_scan_thread is not None and self._ble_scan_thread.isRunning():
+            self._ble_scan_thread.wait(2000)
+            self._ble_scan_thread = None
         if self._ble_thread is not None:
             self._ble_thread.request_stop()
             self._ble_thread.wait(8000)

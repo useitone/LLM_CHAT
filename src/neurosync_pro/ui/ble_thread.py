@@ -1,4 +1,4 @@
-"""Background BLE notify session in a QThread (own asyncio loop)."""
+"""Background BLE tasks in QThreads (own asyncio loops)."""
 
 from __future__ import annotations
 
@@ -69,3 +69,62 @@ class BleNotifyThread(QThread):
                 self._loop = None
             self._stop_ev = None
             self.workerFinished.emit()
+
+
+class BleScanThread(QThread):
+    """Scan BLE devices and emit (name,address,rssi) rows."""
+
+    scanResult = Signal(list)
+    scanFailed = Signal(str)
+
+    def __init__(self, *, scan_time_s: float = 10.0, name_filter: str = "BrainLink", parent=None) -> None:
+        super().__init__(parent)
+        self._scan_time_s = float(scan_time_s)
+        self._name_filter = (name_filter or "").strip()
+
+    def run(self) -> None:  # noqa: D102
+        try:
+            from bleak import BleakScanner  # local import to keep UI import cheap
+        except Exception as exc:  # pragma: no cover
+            self.scanFailed.emit(str(exc))
+            return
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            rows = loop.run_until_complete(self._scan(loop, BleakScanner))
+            self.scanResult.emit(rows)
+        except Exception as exc:  # pragma: no cover - hardware
+            self.scanFailed.emit(str(exc))
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+    async def _scan(self, _loop: asyncio.AbstractEventLoop, scanner) -> list[dict]:
+        # Newer bleak supports return_adv=True; fall back for older versions.
+        rows: list[dict] = []
+        name_filter_l = self._name_filter.lower()
+        try:
+            devices_with_adv = await scanner.discover(timeout=self._scan_time_s, return_adv=True)
+            pairs = list(devices_with_adv.values())
+            for d, adv in pairs:
+                name = getattr(d, "name", None)
+                address = getattr(d, "address", "")
+                rssi = getattr(adv, "rssi", None)
+                if name_filter_l and (name or "").lower().find(name_filter_l) < 0:
+                    continue
+                rows.append({"name": name, "address": address, "rssi": rssi})
+        except TypeError:
+            devices = await scanner.discover(timeout=self._scan_time_s)
+            for d in devices:
+                name = getattr(d, "name", None)
+                address = getattr(d, "address", "")
+                rssi = getattr(d, "rssi", None)
+                if name_filter_l and (name or "").lower().find(name_filter_l) < 0:
+                    continue
+                rows.append({"name": name, "address": address, "rssi": rssi})
+
+        rows.sort(key=lambda r: ((r.get("name") or ""), (r.get("address") or "")))
+        return rows
