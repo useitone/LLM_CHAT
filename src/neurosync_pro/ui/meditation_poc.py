@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import json
+import random
 import sys
 import tempfile
 import time
@@ -165,6 +166,22 @@ class MeditationMainWindow(QMainWindow):
         self._eeg_tone_vol_src = "meditation"  # off|attention|meditation
         self._eeg_tone_fixed_vol = 0.08
 
+        # EEG → Binaural (stereo, random delta)
+        self._eeg_bin_available = ToneSweepStream is not None
+        self._eeg_bin_enabled = False
+        self._eeg_bin_stream = None
+        self._eeg_bin_base_min_hz = 200.0
+        self._eeg_bin_base_max_hz = 500.0
+        self._eeg_bin_base_src = "attention"  # attention|meditation
+        self._eeg_bin_delta_min_hz = 2.0
+        self._eeg_bin_delta_max_hz = 20.0
+        self._eeg_bin_delta_update_s = 5.0
+        self._eeg_bin_fixed_vol = 0.08
+        self._eeg_bin_alpha = 0.18
+        self._eeg_bin_base_hz = 300.0
+        self._eeg_bin_delta_hz = 8.0
+        self._eeg_bin_last_delta_at = 0.0
+
         # Link/quality stats (session time, Hz, last sample age).
         self._session_started_at: float | None = None
         self._last_metric_at: float | None = None
@@ -314,6 +331,59 @@ class MeditationMainWindow(QMainWindow):
         form.addRow("Vol source", self._tone_vol_src)
         form.addRow("Fixed vol", self._tone_fixed_vol)
 
+        self._eeg_bin_cb = QCheckBox("EEG → Binaural (stereo, random Δf)")
+        self._eeg_bin_cb.setEnabled(self._eeg_bin_available)
+        if not self._eeg_bin_available:
+            self._eeg_bin_cb.setToolTip("Установите audio extras: pip install -e \".[audio]\"")
+        self._eeg_bin_cb.toggled.connect(self._toggle_eeg_binaural)
+
+        self._eeg_bin_box = QGroupBox("EEG → Binaural настройки")
+        self._eeg_bin_box.setEnabled(self._eeg_bin_available)
+        self._eeg_bin_box.setVisible(False)
+        bform = QFormLayout(self._eeg_bin_box)
+        self._bin_base_min = QDoubleSpinBox()
+        self._bin_base_min.setRange(1.0, 20000.0)
+        self._bin_base_min.setValue(self._eeg_bin_base_min_hz)
+        self._bin_base_min.setSuffix(" Hz")
+        self._bin_base_min.valueChanged.connect(lambda v: setattr(self, "_eeg_bin_base_min_hz", float(v)))
+        self._bin_base_max = QDoubleSpinBox()
+        self._bin_base_max.setRange(1.0, 20000.0)
+        self._bin_base_max.setValue(self._eeg_bin_base_max_hz)
+        self._bin_base_max.setSuffix(" Hz")
+        self._bin_base_max.valueChanged.connect(lambda v: setattr(self, "_eeg_bin_base_max_hz", float(v)))
+        self._bin_base_src = QComboBox()
+        self._bin_base_src.addItem("Attention → base Hz", userData="attention")
+        self._bin_base_src.addItem("Meditation → base Hz", userData="meditation")
+        self._bin_base_src.currentIndexChanged.connect(self._bin_base_src_changed)
+        self._bin_delta_min = QDoubleSpinBox()
+        self._bin_delta_min.setRange(0.1, 200.0)
+        self._bin_delta_min.setValue(self._eeg_bin_delta_min_hz)
+        self._bin_delta_min.setSuffix(" Hz")
+        self._bin_delta_min.valueChanged.connect(lambda v: setattr(self, "_eeg_bin_delta_min_hz", float(v)))
+        self._bin_delta_max = QDoubleSpinBox()
+        self._bin_delta_max.setRange(0.1, 200.0)
+        self._bin_delta_max.setValue(self._eeg_bin_delta_max_hz)
+        self._bin_delta_max.setSuffix(" Hz")
+        self._bin_delta_max.valueChanged.connect(lambda v: setattr(self, "_eeg_bin_delta_max_hz", float(v)))
+        self._bin_delta_update = QDoubleSpinBox()
+        self._bin_delta_update.setRange(0.5, 60.0)
+        self._bin_delta_update.setValue(self._eeg_bin_delta_update_s)
+        self._bin_delta_update.setSuffix(" s")
+        self._bin_delta_update.valueChanged.connect(lambda v: setattr(self, "_eeg_bin_delta_update_s", float(v)))
+        self._bin_vol = QDoubleSpinBox()
+        self._bin_vol.setRange(0.0, 1.0)
+        self._bin_vol.setSingleStep(0.01)
+        self._bin_vol.setValue(self._eeg_bin_fixed_vol)
+        self._bin_vol.valueChanged.connect(lambda v: setattr(self, "_eeg_bin_fixed_vol", float(v)))
+
+        bform.addRow("Base Hz min", self._bin_base_min)
+        bform.addRow("Base Hz max", self._bin_base_max)
+        bform.addRow("Base source", self._bin_base_src)
+        bform.addRow("Δf min", self._bin_delta_min)
+        bform.addRow("Δf max", self._bin_delta_max)
+        bform.addRow("Δf update", self._bin_delta_update)
+        bform.addRow("Volume", self._bin_vol)
+
         # BLE scan controls (when address not passed explicitly).
         self._ble_scan_btn = QPushButton("Сканировать BrainLink")
         self._ble_scan_btn.clicked.connect(self._scan_ble)
@@ -345,6 +415,8 @@ class MeditationMainWindow(QMainWindow):
         lay.addWidget(sess_row)
         lay.addWidget(self._eeg_tone_cb)
         lay.addWidget(self._eeg_tone_box)
+        lay.addWidget(self._eeg_bin_cb)
+        lay.addWidget(self._eeg_bin_box)
         plot_row = QWidget()
         plot_row_lay = QHBoxLayout(plot_row)
         plot_row_lay.setContentsMargins(0, 0, 0, 0)
@@ -400,6 +472,8 @@ class MeditationMainWindow(QMainWindow):
     def _toggle_eeg_tone(self, on: bool) -> None:
         self._eeg_tone_enabled = bool(on)
         self._eeg_tone_box.setVisible(self._eeg_tone_enabled)
+        if self._eeg_tone_enabled and self._eeg_bin_enabled:
+            self._eeg_bin_cb.setChecked(False)
         if not self._eeg_tone_enabled:
             self._stop_eeg_tone()
 
@@ -413,6 +487,43 @@ class MeditationMainWindow(QMainWindow):
         if data in ("off", "attention", "meditation"):
             self._eeg_tone_vol_src = str(data)
         self._tone_fixed_vol.setEnabled(self._eeg_tone_vol_src == "off")
+
+    def _toggle_eeg_binaural(self, on: bool) -> None:
+        self._eeg_bin_enabled = bool(on)
+        self._eeg_bin_box.setVisible(self._eeg_bin_enabled)
+        if self._eeg_bin_enabled and self._eeg_tone_enabled:
+            self._eeg_tone_cb.setChecked(False)
+        if not self._eeg_bin_enabled:
+            self._stop_eeg_binaural()
+
+    def _bin_base_src_changed(self, _idx: int) -> None:
+        data = self._bin_base_src.currentData()
+        if data in ("attention", "meditation"):
+            self._eeg_bin_base_src = str(data)
+
+    def _ensure_eeg_binaural_stream(self) -> bool:
+        if not self._eeg_bin_available:
+            return False
+        if self._eeg_bin_stream is None:
+            try:
+                self._eeg_bin_stream = ToneSweepStream(StreamConfig(sample_rate=48000, channels=2))
+                self._eeg_bin_stream.set_fades(0.02, 0.08)
+                self._eeg_bin_stream.start()
+            except Exception as exc:
+                self._status.setText(f"Audio ошибка: {exc}")
+                self._eeg_bin_stream = None
+                self._eeg_bin_cb.setChecked(False)
+                return False
+        return True
+
+    def _stop_eeg_binaural(self) -> None:
+        st = self._eeg_bin_stream
+        self._eeg_bin_stream = None
+        if st is not None:
+            try:
+                st.stop()
+            except Exception:
+                pass
 
     def _ensure_eeg_tone_stream(self) -> bool:
         if not self._eeg_tone_available:
@@ -726,6 +837,7 @@ class MeditationMainWindow(QMainWindow):
         self._append_session_log(att, med)
         self._append_plot_point(att, med)
         self._apply_eeg_tone()
+        self._apply_eeg_binaural()
         if self._status.text().startswith("BLE: подключение"):
             self._status.setText("BLE: поток активен")
 
@@ -786,11 +898,13 @@ class MeditationMainWindow(QMainWindow):
         self._append_session_log(att, med)
         self._append_plot_point(att, med)
         self._apply_eeg_tone()
+        self._apply_eeg_binaural()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self._bio_timer.stop()
         self._stats_timer.stop()
         self._stop_eeg_tone()
+        self._stop_eeg_binaural()
         if self._ble_scan_thread is not None and self._ble_scan_thread.isRunning():
             self._ble_scan_thread.wait(2000)
             self._ble_scan_thread = None
@@ -880,6 +994,39 @@ class MeditationMainWindow(QMainWindow):
             return
         self._eeg_tone_stream.set_volume(float(self._eeg_tone_vol))
         self._eeg_tone_stream.play_tone(float(self._eeg_tone_f_hz))
+
+    def _apply_eeg_binaural(self) -> None:
+        if not self._eeg_bin_enabled:
+            return
+        now = time.monotonic()
+        if now - self._eeg_tone_last_apply < self._eeg_tone_apply_min_s:
+            return
+
+        # Failsafe: if data is stale, stop audio.
+        if self._last_metric_at is None or (now - self._last_metric_at) > 3.0:
+            self._stop_eeg_binaural()
+            return
+
+        base_src = float(self._last_med) / 100.0 if self._eeg_bin_base_src == "meditation" else float(self._last_att) / 100.0
+        base_target = self._eeg_bin_base_min_hz + (self._eeg_bin_base_max_hz - self._eeg_bin_base_min_hz) * base_src
+
+        # Randomize delta periodically.
+        if (now - self._eeg_bin_last_delta_at) >= max(0.5, float(self._eeg_bin_delta_update_s)):
+            lo = min(float(self._eeg_bin_delta_min_hz), float(self._eeg_bin_delta_max_hz))
+            hi = max(float(self._eeg_bin_delta_min_hz), float(self._eeg_bin_delta_max_hz))
+            self._eeg_bin_delta_hz = random.uniform(lo, hi)
+            self._eeg_bin_last_delta_at = now
+
+        a = self._eeg_bin_alpha
+        self._eeg_bin_base_hz = (1.0 - a) * self._eeg_bin_base_hz + a * float(base_target)
+
+        left = float(self._eeg_bin_base_hz)
+        right = float(self._eeg_bin_base_hz + self._eeg_bin_delta_hz)
+
+        if not self._ensure_eeg_binaural_stream():
+            return
+        self._eeg_bin_stream.set_volume(float(self._eeg_bin_fixed_vol))
+        self._eeg_bin_stream.play_binaural(left, right)
 
 
 def run_meditation_poc(

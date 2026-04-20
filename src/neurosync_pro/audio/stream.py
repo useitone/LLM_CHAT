@@ -42,12 +42,14 @@ class ToneSweepStream:
         self.cfg = cfg or StreamConfig()
         self._lock = threading.Lock()
 
-        self._mode: str = "idle"  # idle|tone|sweep
+        self._mode: str = "idle"  # idle|tone|sweep|binaural
         self._volume = 0.15
         self._phase = 0.0
+        self._phase_r = 0.0
 
         # tone params
         self._tone_hz = 440.0
+        self._tone_hz_r = 440.0
 
         # sweep params
         self._sweep_f0 = 200.0
@@ -107,6 +109,14 @@ class ToneSweepStream:
         with self._lock:
             self._tone_hz = max(1.0, float(freq_hz))
             self._mode = "tone"
+            self._sweep_start_t = None
+
+    def play_binaural(self, left_hz: float, right_hz: float) -> None:
+        """Stereo tone: left and right frequencies may differ (binaural beats with headphones)."""
+        with self._lock:
+            self._tone_hz = max(1.0, float(left_hz))
+            self._tone_hz_r = max(1.0, float(right_hz))
+            self._mode = "binaural"
             self._sweep_start_t = None
 
     def play_sweep(
@@ -171,6 +181,35 @@ class ToneSweepStream:
                 self._phase = phase_end % (2.0 * math.pi)
             y *= np.float32(vol)
             outdata[:, 0] = y
+            if outdata.shape[1] > 1:
+                outdata[:, 1] = y
+            return
+
+        if mode == "binaural":
+            # Stereo constant frequencies.
+            phase_l = phase0 + (2.0 * math.pi * float(tone_hz)) * t
+            y_l = np.sin(phase_l, dtype=np.float32)
+            phase_end_l = float(phase_l[-1] + (2.0 * math.pi * float(tone_hz)) / sr)
+
+            with self._lock:
+                phase0_r = self._phase_r
+                tone_hz_r = self._tone_hz_r
+
+            phase_r = phase0_r + (2.0 * math.pi * float(tone_hz_r)) * t
+            y_r = np.sin(phase_r, dtype=np.float32)
+            phase_end_r = float(phase_r[-1] + (2.0 * math.pi * float(tone_hz_r)) / sr)
+
+            with self._lock:
+                self._phase = phase_end_l % (2.0 * math.pi)
+                self._phase_r = phase_end_r % (2.0 * math.pi)
+
+            y_l *= np.float32(vol)
+            y_r *= np.float32(vol)
+            outdata[:, 0] = y_l
+            if outdata.shape[1] > 1:
+                outdata[:, 1] = y_r
+            else:
+                outdata[:, 0] = (y_l + y_r) * np.float32(0.5)
             return
 
         # Sweep mode.

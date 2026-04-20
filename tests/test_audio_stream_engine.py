@@ -24,3 +24,13 @@ def test_sweep_runs_and_outputs_nonzero() -> None:
     s._callback(out, 512, None, None)  # type: ignore[arg-type]
     assert float(np.max(np.abs(out))) > 0.0
 
+
+def test_binaural_stereo_outputs_both_channels() -> None:
+    s = ToneSweepStream(StreamConfig(sample_rate=48000, channels=2))
+    out = np.zeros((256, 2), dtype=np.float32)
+    s.play_binaural(220.0, 232.0)
+    s._callback(out, 256, None, None)  # type: ignore[arg-type]
+    assert out.shape == (256, 2)
+    assert float(np.max(np.abs(out[:, 0]))) > 0.0
+    assert float(np.max(np.abs(out[:, 1]))) > 0.0
+
