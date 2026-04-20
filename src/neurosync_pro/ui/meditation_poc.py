@@ -21,6 +21,9 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -158,6 +161,9 @@ class MeditationMainWindow(QMainWindow):
         self._eeg_tone_vol = 0.0
         self._eeg_tone_last_apply = 0.0
         self._eeg_tone_apply_min_s = 0.10  # 10 Hz
+        self._eeg_tone_freq_src = "attention"  # attention|meditation
+        self._eeg_tone_vol_src = "meditation"  # off|attention|meditation
+        self._eeg_tone_fixed_vol = 0.08
 
         # Link/quality stats (session time, Hz, last sample age).
         self._session_started_at: float | None = None
@@ -256,6 +262,58 @@ class MeditationMainWindow(QMainWindow):
             self._eeg_tone_cb.setToolTip("Установите audio extras: pip install -e \".[audio]\"")
         self._eeg_tone_cb.toggled.connect(self._toggle_eeg_tone)
 
+        self._eeg_tone_box = QGroupBox("EEG → Tone настройки")
+        self._eeg_tone_box.setEnabled(self._eeg_tone_available)
+        self._eeg_tone_box.setVisible(False)
+        form = QFormLayout(self._eeg_tone_box)
+        self._tone_min_hz = QDoubleSpinBox()
+        self._tone_min_hz.setRange(1.0, 20000.0)
+        self._tone_min_hz.setValue(self._eeg_tone_min_hz)
+        self._tone_min_hz.setSuffix(" Hz")
+        self._tone_min_hz.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_min_hz", float(v)))
+        self._tone_max_hz = QDoubleSpinBox()
+        self._tone_max_hz.setRange(1.0, 20000.0)
+        self._tone_max_hz.setValue(self._eeg_tone_max_hz)
+        self._tone_max_hz.setSuffix(" Hz")
+        self._tone_max_hz.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_max_hz", float(v)))
+        self._tone_min_vol = QDoubleSpinBox()
+        self._tone_min_vol.setRange(0.0, 1.0)
+        self._tone_min_vol.setSingleStep(0.01)
+        self._tone_min_vol.setValue(self._eeg_tone_min_vol)
+        self._tone_min_vol.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_min_vol", float(v)))
+        self._tone_max_vol = QDoubleSpinBox()
+        self._tone_max_vol.setRange(0.0, 1.0)
+        self._tone_max_vol.setSingleStep(0.01)
+        self._tone_max_vol.setValue(self._eeg_tone_max_vol)
+        self._tone_max_vol.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_max_vol", float(v)))
+
+        self._tone_freq_src = QComboBox()
+        self._tone_freq_src.addItem("Attention → Hz", userData="attention")
+        self._tone_freq_src.addItem("Meditation → Hz", userData="meditation")
+        self._tone_freq_src.currentIndexChanged.connect(self._tone_freq_src_changed)
+
+        self._tone_vol_src = QComboBox()
+        self._tone_vol_src.addItem("Volume: Off (fixed)", userData="off")
+        self._tone_vol_src.addItem("Meditation → Volume", userData="meditation")
+        self._tone_vol_src.addItem("Attention → Volume", userData="attention")
+        self._tone_vol_src.setCurrentIndex(1)
+        self._tone_vol_src.currentIndexChanged.connect(self._tone_vol_src_changed)
+
+        self._tone_fixed_vol = QDoubleSpinBox()
+        self._tone_fixed_vol.setRange(0.0, 1.0)
+        self._tone_fixed_vol.setSingleStep(0.01)
+        self._tone_fixed_vol.setValue(self._eeg_tone_fixed_vol)
+        self._tone_fixed_vol.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_fixed_vol", float(v)))
+        self._tone_fixed_vol.setEnabled(False)
+
+        form.addRow("Hz min", self._tone_min_hz)
+        form.addRow("Hz max", self._tone_max_hz)
+        form.addRow("Freq source", self._tone_freq_src)
+        form.addRow("Vol min", self._tone_min_vol)
+        form.addRow("Vol max", self._tone_max_vol)
+        form.addRow("Vol source", self._tone_vol_src)
+        form.addRow("Fixed vol", self._tone_fixed_vol)
+
         # BLE scan controls (when address not passed explicitly).
         self._ble_scan_btn = QPushButton("Сканировать BrainLink")
         self._ble_scan_btn.clicked.connect(self._scan_ble)
@@ -286,6 +344,7 @@ class MeditationMainWindow(QMainWindow):
         sess_lay.addStretch(1)
         lay.addWidget(sess_row)
         lay.addWidget(self._eeg_tone_cb)
+        lay.addWidget(self._eeg_tone_box)
         plot_row = QWidget()
         plot_row_lay = QHBoxLayout(plot_row)
         plot_row_lay.setContentsMargins(0, 0, 0, 0)
@@ -340,8 +399,20 @@ class MeditationMainWindow(QMainWindow):
 
     def _toggle_eeg_tone(self, on: bool) -> None:
         self._eeg_tone_enabled = bool(on)
+        self._eeg_tone_box.setVisible(self._eeg_tone_enabled)
         if not self._eeg_tone_enabled:
             self._stop_eeg_tone()
+
+    def _tone_freq_src_changed(self, _idx: int) -> None:
+        data = self._tone_freq_src.currentData()
+        if data in ("attention", "meditation"):
+            self._eeg_tone_freq_src = str(data)
+
+    def _tone_vol_src_changed(self, _idx: int) -> None:
+        data = self._tone_vol_src.currentData()
+        if data in ("off", "attention", "meditation"):
+            self._eeg_tone_vol_src = str(data)
+        self._tone_fixed_vol.setEnabled(self._eeg_tone_vol_src == "off")
 
     def _ensure_eeg_tone_stream(self) -> bool:
         if not self._eeg_tone_available:
@@ -792,8 +863,14 @@ class MeditationMainWindow(QMainWindow):
         # Map metrics.
         att = float(self._last_att) / 100.0
         med = float(self._last_med) / 100.0
-        target_f = self._eeg_tone_min_hz + (self._eeg_tone_max_hz - self._eeg_tone_min_hz) * att
-        target_v = self._eeg_tone_min_vol + (self._eeg_tone_max_vol - self._eeg_tone_min_vol) * med
+        freq_src = med if self._eeg_tone_freq_src == "meditation" else att
+        target_f = self._eeg_tone_min_hz + (self._eeg_tone_max_hz - self._eeg_tone_min_hz) * freq_src
+
+        if self._eeg_tone_vol_src == "off":
+            target_v = float(self._eeg_tone_fixed_vol)
+        else:
+            vol_src = med if self._eeg_tone_vol_src == "meditation" else att
+            target_v = self._eeg_tone_min_vol + (self._eeg_tone_max_vol - self._eeg_tone_min_vol) * vol_src
 
         a = self._eeg_tone_alpha
         self._eeg_tone_f_hz = (1.0 - a) * self._eeg_tone_f_hz + a * target_f
