@@ -4,15 +4,18 @@ PoC: meditation / concentration — phased hints, EEG from JSONL or live BLE, ag
 
 from __future__ import annotations
 
+import math
 import json
 import sys
 import tempfile
+import time
+from collections import deque
 from datetime import UTC, datetime
 from io import TextIOBase
 from pathlib import Path
 from typing import Any, Iterator
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QPointF, Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -25,6 +28,11 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
+except Exception:  # pragma: no cover - optional addon
+    QChart = QChartView = QLineSeries = QValueAxis = None  # type: ignore[misc,assignment]
 
 from neurosync_pro.agent.server import start_agent_api, stop_agent_api
 from neurosync_pro.audio.engine import sine_pcm16_mono, write_wav_pcm16_mono
@@ -127,6 +135,20 @@ class MeditationMainWindow(QMainWindow):
         self._last_att = 0
         self._last_med = 0
 
+        # Simple rolling metrics plot (optional, requires PySide6.QtCharts).
+        self._plot_available = QChart is not None
+        self._plot_enabled = False
+        self._plot_window_s = 120.0
+        self._t0 = time.monotonic()
+        self._t = deque(maxlen=2000)  # seconds since start
+        self._att_hist = deque(maxlen=2000)
+        self._med_hist = deque(maxlen=2000)
+        self._series_att = None
+        self._series_med = None
+        self._axis_x = None
+        self._axis_y = None
+        self._chart_view = None
+
         self._eeg_it: Iterator[tuple[int, int]] | None = None
         if self._ble_address is None and jsonl_path and jsonl_path.is_file():
             self._eeg_it = iter(_iter_eeg(jsonl_path))
@@ -161,6 +183,12 @@ class MeditationMainWindow(QMainWindow):
         self._api_cb = QCheckBox("Agent API :8765 (POST /v1/event JSON {topic, payload})")
         self._api_cb.toggled.connect(self._toggle_api)
 
+        self._plot_cb = QCheckBox("График (Attention / Meditation)")
+        self._plot_cb.setEnabled(self._plot_available)
+        if not self._plot_available:
+            self._plot_cb.setToolTip("PySide6.QtCharts недоступен в текущей установке.")
+        self._plot_cb.toggled.connect(self._toggle_plot)
+
         self._bio_cb = QCheckBox("Тон обратной связи (высота ~ Attention, громкость ~ Meditation)")
         self._bio_timer = QTimer(self)
         self._bio_timer.setInterval(700)
@@ -178,6 +206,9 @@ class MeditationMainWindow(QMainWindow):
         lay.addWidget(QLabel("Метрики:"))
         lay.addWidget(self._att)
         lay.addWidget(self._med)
+        lay.addWidget(self._plot_cb)
+        if self._plot_available:
+            self._init_plot_widgets(lay)
         if self._ble_address:
             row = QWidget()
             h = QHBoxLayout(row)
@@ -206,6 +237,94 @@ class MeditationMainWindow(QMainWindow):
 
         if auto_start_ble and self._ble_address:
             QTimer.singleShot(300, self._start_ble)
+
+    def _toggle_plot(self, on: bool) -> None:
+        if not self._plot_available:
+            return
+        self._plot_enabled = bool(on)
+        if self._chart_view is not None:
+            self._chart_view.setVisible(self._plot_enabled)
+        if self._plot_enabled:
+            self._refresh_plot(force=True)
+
+    def _init_plot_widgets(self, lay: QVBoxLayout) -> None:
+        if not self._plot_available:
+            return
+        # Lazily create chart stack.
+        series_att = QLineSeries()
+        series_att.setName("Attention")
+        series_med = QLineSeries()
+        series_med.setName("Meditation")
+        chart = QChart()
+        chart.addSeries(series_att)
+        chart.addSeries(series_med)
+        chart.legend().setVisible(True)
+        chart.setBackgroundRoundness(0)
+
+        axis_x = QValueAxis()
+        axis_x.setTitleText("t, s")
+        axis_x.setRange(0, self._plot_window_s)
+        axis_x.setLabelFormat("%.0f")
+        axis_y = QValueAxis()
+        axis_y.setRange(0, 100)
+        axis_y.setTitleText("value")
+        axis_y.setLabelFormat("%.0f")
+
+        chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
+        chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
+        series_att.attachAxis(axis_x)
+        series_att.attachAxis(axis_y)
+        series_med.attachAxis(axis_x)
+        series_med.attachAxis(axis_y)
+
+        view = QChartView(chart)
+        view.setMinimumHeight(180)
+        view.setVisible(False)  # controlled by checkbox
+        lay.addWidget(view)
+
+        self._series_att = series_att
+        self._series_med = series_med
+        self._axis_x = axis_x
+        self._axis_y = axis_y
+        self._chart_view = view
+
+    def _append_plot_point(self, att: int, med: int) -> None:
+        if not self._plot_available:
+            return
+        t = time.monotonic() - self._t0
+        self._t.append(t)
+        self._att_hist.append(att)
+        self._med_hist.append(med)
+
+    def _refresh_plot(self, *, force: bool = False) -> None:
+        if not self._plot_available or not self._plot_enabled:
+            return
+        if self._series_att is None or self._series_med is None or self._axis_x is None:
+            return
+        n = len(self._t)
+        if n < 2 and not force:
+            return
+
+        t_end = self._t[-1] if n else 0.0
+        t_start = max(0.0, t_end - self._plot_window_s)
+        self._axis_x.setRange(t_start, max(t_start + 1.0, t_end))
+
+        # Build visible window points.
+        pts_att = []
+        pts_med = []
+        for t, a, m in zip(self._t, self._att_hist, self._med_hist):
+            if t < t_start:
+                continue
+            pts_att.append((t, a))
+            pts_med.append((t, m))
+        # Throttle extreme point counts.
+        if len(pts_att) > 600:
+            step = int(math.ceil(len(pts_att) / 600))
+            pts_att = pts_att[::step]
+            pts_med = pts_med[::step]
+
+        self._series_att.replace([QPointF(x, y) for x, y in pts_att])
+        self._series_med.replace([QPointF(x, y) for x, y in pts_med])
 
     def _toggle_biofeedback(self, on: bool) -> None:
         if on:
@@ -261,6 +380,8 @@ class MeditationMainWindow(QMainWindow):
         self._med.setValue(med)
         self._bus.publish("eeg.metrics", {"attention": att, "meditation": med})
         self._append_session_log(att, med)
+        self._append_plot_point(att, med)
+        self._refresh_plot()
         if self._status.text().startswith("BLE: подключение"):
             self._status.setText("BLE: поток активен")
 
@@ -314,6 +435,8 @@ class MeditationMainWindow(QMainWindow):
         self._med.setValue(med)
         self._bus.publish("eeg.metrics", {"attention": att, "meditation": med})
         self._append_session_log(att, med)
+        self._append_plot_point(att, med)
+        self._refresh_plot()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self._bio_timer.stop()
