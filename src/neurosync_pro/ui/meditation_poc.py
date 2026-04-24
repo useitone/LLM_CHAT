@@ -102,6 +102,7 @@ class MeditationMainWindow(QMainWindow):
         self._bands_full = False
         self._bands_last_ui_at = 0.0
         self._bands_min_ui_s = 0.25
+        self._bands_max_log: dict[str, float] = {}
         self._rssi_scan_thread: BleScanThread | None = None
         self._rssi_timer = QTimer(self)
         self._rssi_timer.setInterval(6000)
@@ -575,7 +576,25 @@ class MeditationMainWindow(QMainWindow):
         self._bands_full_cb.toggled.connect(self._toggle_bands_full)
         self._bands_line = QLabel("нет данных")
         self._bands_line.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._band_bars: dict[str, QProgressBar] = {}
+        self._band_labels: dict[str, QLabel] = {}
+
+        def _mk_bar() -> QProgressBar:
+            pb = QProgressBar()
+            pb.setRange(0, 100)
+            pb.setTextVisible(False)
+            return pb
+
+        for key in ("delta", "theta", "alpha", "beta", "gamma"):
+            self._band_bars[key] = _mk_bar()
+            self._band_labels[key] = QLabel("-")
+
         bform.addRow("", self._bands_full_cb)
+        bform.addRow("δ", self._band_bars["delta"])
+        bform.addRow("θ", self._band_bars["theta"])
+        bform.addRow("α", self._band_bars["alpha"])
+        bform.addRow("β", self._band_bars["beta"])
+        bform.addRow("γ", self._band_bars["gamma"])
         bform.addRow("Bands", self._bands_line)
 
         self._genmon_box = QGroupBox("Generator monitor")
@@ -1166,7 +1185,26 @@ class MeditationMainWindow(QMainWindow):
         b = self._last_bands
         if not b:
             self._bands_line.setText("нет данных")
+            for pb in self._band_bars.values():
+                pb.setValue(0)
             return
+
+        def _log1p(x: int) -> float:
+            return math.log10(1.0 + max(0, int(x)))
+
+        def _norm(name: str, x: int) -> int:
+            # Dynamic range with slow max decay for readable bars.
+            v = _log1p(x)
+            m = float(self._bands_max_log.get(name, 1.0))
+            if v > m:
+                m = v
+            else:
+                # decay ~2% per refresh
+                m = max(0.5, m * 0.98)
+                if v > m:
+                    m = v
+            self._bands_max_log[name] = m
+            return int(100.0 * (v / m)) if m > 1e-9 else 0
 
         if self._bands_full:
             self._bands_line.setText(
@@ -1174,6 +1212,7 @@ class MeditationMainWindow(QMainWindow):
                     **b
                 )
             )
+            # In full mode keep the compact bars driven by aggregated values.
             return
 
         alpha = int(b["low_alpha"]) + int(b["high_alpha"])
@@ -1182,6 +1221,12 @@ class MeditationMainWindow(QMainWindow):
         self._bands_line.setText(
             f"δ={b['delta']}  θ={b['theta']}  α={alpha}  β={beta}  γ={gamma}"
         )
+
+        self._band_bars["delta"].setValue(_norm("delta", int(b["delta"])))
+        self._band_bars["theta"].setValue(_norm("theta", int(b["theta"])))
+        self._band_bars["alpha"].setValue(_norm("alpha", alpha))
+        self._band_bars["beta"].setValue(_norm("beta", beta))
+        self._band_bars["gamma"].setValue(_norm("gamma", gamma))
 
     def _tick_rssi_scan(self) -> None:
         # Best-effort RSSI refresh via a short advertisement scan.
