@@ -583,7 +583,7 @@ class MeditationMainWindow(QMainWindow):
         self._bands_line = QLabel("нет данных")
         self._bands_line.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._band_bars: dict[str, QProgressBar] = {}
-        self._band_labels: dict[str, QLabel] = {}
+        self._band_row_label: dict[str, QLabel] = {}
 
         def _mk_bar() -> QProgressBar:
             pb = QProgressBar()
@@ -591,17 +591,26 @@ class MeditationMainWindow(QMainWindow):
             pb.setTextVisible(False)
             return pb
 
-        for key in ("delta", "theta", "alpha", "beta", "gamma"):
+        def _add_band_row(key: str, label_text: str) -> None:
             self._band_bars[key] = _mk_bar()
-            self._band_labels[key] = QLabel("-")
+            lab = QLabel(label_text)
+            self._band_row_label[key] = lab
+            bform.addRow(lab, self._band_bars[key])
 
         bform.addRow("", self._bands_full_cb)
-        bform.addRow("δ", self._band_bars["delta"])
-        bform.addRow("θ", self._band_bars["theta"])
-        bform.addRow("α", self._band_bars["alpha"])
-        bform.addRow("β", self._band_bars["beta"])
-        bform.addRow("γ", self._band_bars["gamma"])
+        _add_band_row("delta", "δ")
+        _add_band_row("theta", "θ")
+        _add_band_row("alpha", "α")
+        _add_band_row("beta", "β")
+        _add_band_row("gamma", "γ")
+        _add_band_row("low_alpha", "αL")
+        _add_band_row("high_alpha", "αH")
+        _add_band_row("low_beta", "βL")
+        _add_band_row("high_beta", "βH")
+        _add_band_row("low_gamma", "γL")
+        _add_band_row("high_gamma", "γH")
         bform.addRow("Bands", self._bands_line)
+        self._apply_bands_rows_visibility()
 
         self._genmon_box = QGroupBox("Generator monitor")
         mid_lay.addWidget(self._genmon_box)
@@ -1212,7 +1221,28 @@ class MeditationMainWindow(QMainWindow):
     def _toggle_bands_full(self, on: bool) -> None:
         self._bands_full = bool(on)
         self._bands_box.setTitle("Bands (Full)" if self._bands_full else "Bands (Compact)")
+        self._apply_bands_rows_visibility()
         self._refresh_bands_ui(force=True)
+
+    def _apply_bands_rows_visibility(self) -> None:
+        compact_keys = {"delta", "theta", "alpha", "beta", "gamma"}
+        full_keys = {
+            "delta",
+            "theta",
+            "low_alpha",
+            "high_alpha",
+            "low_beta",
+            "high_beta",
+            "low_gamma",
+            "high_gamma",
+        }
+        show = full_keys if self._bands_full else compact_keys
+        for key, pb in self._band_bars.items():
+            vis = key in show
+            pb.setVisible(vis)
+            lab = self._band_row_label.get(key)
+            if lab is not None:
+                lab.setVisible(vis)
 
     def _refresh_bands_ui(self, *, force: bool = False) -> None:
         now = time.monotonic()
@@ -1250,7 +1280,14 @@ class MeditationMainWindow(QMainWindow):
                     **b
                 )
             )
-            # In full mode keep the compact bars driven by aggregated values.
+            self._band_bars["delta"].setValue(_norm("delta", int(b["delta"])))
+            self._band_bars["theta"].setValue(_norm("theta", int(b["theta"])))
+            self._band_bars["low_alpha"].setValue(_norm("low_alpha", int(b["low_alpha"])))
+            self._band_bars["high_alpha"].setValue(_norm("high_alpha", int(b["high_alpha"])))
+            self._band_bars["low_beta"].setValue(_norm("low_beta", int(b["low_beta"])))
+            self._band_bars["high_beta"].setValue(_norm("high_beta", int(b["high_beta"])))
+            self._band_bars["low_gamma"].setValue(_norm("low_gamma", int(b["low_gamma"])))
+            self._band_bars["high_gamma"].setValue(_norm("high_gamma", int(b["high_gamma"])))
             return
 
         alpha = int(b["low_alpha"]) + int(b["high_alpha"])
