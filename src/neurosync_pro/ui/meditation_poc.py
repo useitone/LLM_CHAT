@@ -171,6 +171,10 @@ class MeditationMainWindow(QMainWindow):
         self._session_started_at: float | None = None
         self._last_metric_at: float | None = None
         self._metric_times = deque(maxlen=5000)
+        self._bands_change_times = deque(maxlen=5000)
+        self._metrics_change_times = deque(maxlen=5000)
+        self._prev_metrics: tuple[int, int] | None = None
+        self._prev_bands_compact: tuple[int, int, int, int, int] | None = None
         self._stats_timer = QTimer(self)
         self._stats_timer.setInterval(1000)
         self._stats_timer.timeout.connect(self._update_stats_line)
@@ -538,12 +542,14 @@ class MeditationMainWindow(QMainWindow):
         self._status = QLabel("")
         self._stats = QLabel("")
 
-        # Left panel content.
-        left_lay.addWidget(self._src_label)
-        left_lay.addWidget(self._stats)
-        left_lay.addWidget(QLabel("Метрики:"))
-        left_lay.addWidget(self._att)
-        left_lay.addWidget(self._med)
+        # Center-top: source + stats + metrics (keep in the middle panel).
+        mid_lay.addWidget(self._src_label)
+        mid_lay.addWidget(self._stats)
+        mid_lay.addWidget(QLabel("Метрики:"))
+        mid_lay.addWidget(self._att)
+        mid_lay.addWidget(self._med)
+
+        # Left panel content (controls-only).
         sess_row = QWidget()
         sess_lay = QHBoxLayout(sess_row)
         sess_lay.setContentsMargins(0, 0, 0, 0)
@@ -1024,6 +1030,11 @@ class MeditationMainWindow(QMainWindow):
         now = time.monotonic()
         self._last_metric_at = now
         self._metric_times.append(now)
+        prev = self._prev_metrics
+        cur = (int(att), int(med))
+        if prev is None or cur != prev:
+            self._metrics_change_times.append(now)
+            self._prev_metrics = cur
         self._last_att = att
         self._last_med = med
         self._att.setValue(att)
@@ -1065,6 +1076,15 @@ class MeditationMainWindow(QMainWindow):
             "low_gamma": int(low_gamma),
             "high_gamma": int(high_gamma),
         }
+        # Track compact changes (δ/θ/α/β/γ) for rate diagnostics.
+        alpha = int(low_alpha) + int(high_alpha)
+        beta = int(low_beta) + int(high_beta)
+        gamma = int(low_gamma) + int(high_gamma)
+        cur_c = (int(delta), int(theta), int(alpha), int(beta), int(gamma))
+        prev_c = self._prev_bands_compact
+        if prev_c is None or cur_c != prev_c:
+            self._bands_change_times.append(time.monotonic())
+            self._prev_bands_compact = cur_c
         self._refresh_bands_ui()
 
     def _on_ble_failed(self, msg: str) -> None:
@@ -1157,6 +1177,24 @@ class MeditationMainWindow(QMainWindow):
                 n += 1
             hz = n / 10.0
             parts.append(f"{hz:.1f} Hz")
+
+        # Change rates over last 10 seconds (how often values change).
+        if self._metrics_change_times:
+            cutoff = now - 10.0
+            n = 0
+            for t in reversed(self._metrics_change_times):
+                if t < cutoff:
+                    break
+                n += 1
+            parts.append(f"ΔA/M {n/10.0:.1f} Hz")
+        if self._bands_change_times:
+            cutoff = now - 10.0
+            n = 0
+            for t in reversed(self._bands_change_times):
+                if t < cutoff:
+                    break
+                n += 1
+            parts.append(f"ΔBands {n/10.0:.1f} Hz")
 
         if self._last_metric_at is not None:
             age = now - self._last_metric_at
