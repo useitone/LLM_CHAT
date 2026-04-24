@@ -25,6 +25,10 @@ docs/specs/sessions/
 docs/specs/*.json
 docs/specs/*.jsonl
 
+# Исторические материалы (не держим бинарники в git)
+docs/neuroexperimenter/*.docx
+docs/neuroexperimenter/*.pdf
+
 # Локальный клон сторонних репо для разбора (см. docs/specs/vendor/README.md)
 docs/specs/vendor/brainlink_parser_linux/
 
