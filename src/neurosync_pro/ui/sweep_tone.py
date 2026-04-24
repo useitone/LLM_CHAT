@@ -25,6 +25,7 @@ class SweepToneMainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("NeuroSync Pro — Tone / Sweep (MVP)")
         self._stream = ToneSweepStream(StreamConfig(sample_rate=48000))
+        self._noise_stream: ToneSweepStream | None = None
 
         cw = QWidget()
         root = QVBoxLayout(cw)
@@ -82,15 +83,29 @@ class SweepToneMainWindow(QMainWindow):
         common_form.addRow("Fade in", self._fade_in)
         common_form.addRow("Fade out", self._fade_out)
 
+        # Noise controls
+        noise_box = QGroupBox("Noise")
+        noise_form = QFormLayout(noise_box)
+        self._noise_stereo = QCheckBox("Stereo (L/R)")
+        self._noise_seed = QDoubleSpinBox()
+        self._noise_seed.setRange(0.0, 1_000_000_000.0)
+        self._noise_seed.setDecimals(0)
+        self._noise_seed.setValue(123.0)
+        self._noise_seed.setToolTip("RNG seed (integer). Set 0 to disable seeding.")
+        noise_form.addRow("", self._noise_stereo)
+        noise_form.addRow("Seed", self._noise_seed)
+
         # Buttons
         btn_row = QWidget()
         btns = QHBoxLayout(btn_row)
         self._tone_btn = QPushButton("Play tone")
         self._sweep_btn = QPushButton("Play sweep")
+        self._noise_btn = QPushButton("Play noise")
         self._stop_btn = QPushButton("Stop")
         self._stop_btn.setEnabled(False)
         btns.addWidget(self._tone_btn)
         btns.addWidget(self._sweep_btn)
+        btns.addWidget(self._noise_btn)
         btns.addWidget(self._stop_btn)
 
         self._status = QLabel("")
@@ -98,6 +113,7 @@ class SweepToneMainWindow(QMainWindow):
 
         root.addWidget(tone_box)
         root.addWidget(sweep_box)
+        root.addWidget(noise_box)
         root.addWidget(common_box)
         root.addWidget(btn_row)
         root.addWidget(self._status)
@@ -106,6 +122,7 @@ class SweepToneMainWindow(QMainWindow):
 
         self._tone_btn.clicked.connect(self._play_tone)
         self._sweep_btn.clicked.connect(self._play_sweep)
+        self._noise_btn.clicked.connect(self._play_noise)
         self._stop_btn.clicked.connect(self._stop)
 
     def _apply_common(self) -> None:
@@ -134,15 +151,48 @@ class SweepToneMainWindow(QMainWindow):
         self._status.setText(f"Sweep {mode} {self._f0.value():.0f}->{self._f1.value():.0f} Hz, {self._dur.value():.1f}s{lp}")
         self._stop_btn.setEnabled(True)
 
+    def _play_noise(self) -> None:
+        self._apply_common()
+        stereo = bool(self._noise_stereo.isChecked())
+        seed = int(self._noise_seed.value())
+        seed_arg = None if seed <= 0 else seed
+        if stereo:
+            if self._noise_stream is None or int(self._noise_stream.cfg.channels) != 2:
+                try:
+                    self._noise_stream.stop()
+                except Exception:
+                    pass
+                self._noise_stream = ToneSweepStream(StreamConfig(sample_rate=48000, channels=2))
+            st = self._noise_stream
+        else:
+            st = self._stream
+        st.set_volume(float(self._vol.value()))
+        st.set_fades(float(self._fade_in.value()), float(self._fade_out.value()))
+        st.start()
+        st.play_noise(seed=seed_arg)
+        self._status.setText("Noise (white)" + (" stereo" if stereo else " mono"))
+        self._stop_btn.setEnabled(True)
+
     def _stop(self) -> None:
         self._stream.idle()
         self._stream.stop()
+        if self._noise_stream is not None:
+            try:
+                self._noise_stream.idle()
+                self._noise_stream.stop()
+            except Exception:
+                pass
         self._status.setText("Stopped.")
         self._stop_btn.setEnabled(False)
 
     def closeEvent(self, event) -> None:  # noqa: N802, ANN001
         try:
             self._stream.stop()
+            if self._noise_stream is not None:
+                try:
+                    self._noise_stream.stop()
+                except Exception:
+                    pass
         finally:
             super().closeEvent(event)
 

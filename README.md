@@ -38,6 +38,7 @@ neurosync-pro agent-serve
 python scripts/brainlink_verify_one_session.py --summary
 neurosync-pro tone --freq 440 --duration 2
 neurosync-pro sweep --f0 200 --f1 1000 --duration 10
+neurosync-pro noise --duration 5 --volume 0.15
 neurosync-pro sweep-ui
 ```
 

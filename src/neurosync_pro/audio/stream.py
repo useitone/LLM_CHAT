@@ -42,7 +42,7 @@ class ToneSweepStream:
         self.cfg = cfg or StreamConfig()
         self._lock = threading.Lock()
 
-        self._mode: str = "idle"  # idle|tone|sweep|binaural
+        self._mode: str = "idle"  # idle|tone|sweep|binaural|noise
         self._volume = 0.15
         self._volume_l = 0.15
         self._volume_r = 0.15
@@ -64,6 +64,11 @@ class ToneSweepStream:
         # envelope (avoid clicks)
         self._fade_in = 0.02
         self._fade_out = 0.05
+
+        # noise params
+        self._noise_start_t: float | None = None
+        self._noise_stop_t: float | None = None
+        self._noise_rng = np.random.default_rng()
 
         self._stream = None
 
@@ -153,8 +158,22 @@ class ToneSweepStream:
 
     def idle(self) -> None:
         with self._lock:
+            if self._mode == "noise":
+                # Fade out noise without clicks.
+                self._noise_stop_t = time.monotonic()
+                return
             self._mode = "idle"
             self._sweep_start_t = None
+
+    def play_noise(self, *, seed: int | None = None) -> None:
+        """Play white noise continuously (mono or stereo depending on stream channels)."""
+        with self._lock:
+            if seed is not None:
+                self._noise_rng = np.random.default_rng(int(seed))
+            self._mode = "noise"
+            self._sweep_start_t = None
+            self._noise_start_t = time.monotonic()
+            self._noise_stop_t = None
 
     def _callback(self, outdata: np.ndarray, frames: int, _time_info, status) -> None:  # noqa: ANN001
         if status:
@@ -226,6 +245,36 @@ class ToneSweepStream:
                 outdata[:, 1] = y_r
             else:
                 outdata[:, 0] = (y_l + y_r) * np.float32(0.5)
+            return
+
+        if mode == "noise":
+            # White noise. Use fade-in/out envelope to avoid clicks.
+            with self._lock:
+                rng = self._noise_rng
+                ns = self._noise_start_t
+                ne = self._noise_stop_t
+            now = time.monotonic()
+
+            env = 1.0
+            if fade_in > 0 and ns is not None:
+                env *= _clamp((now - ns) / float(fade_in), 0.0, 1.0)
+            if ne is not None and fade_out > 0:
+                env *= _clamp((float(fade_out) - (now - ne)) / float(fade_out), 0.0, 1.0)
+                if env <= 0.0:
+                    self.idle()
+                    outdata[:] = 0.0
+                    return
+
+            if outdata.shape[1] > 1:
+                y = rng.standard_normal((frames, outdata.shape[1]), dtype=np.float32)
+                y[:, 0] *= np.float32(vol_l)
+                y[:, 1] *= np.float32(vol_r)
+                if outdata.shape[1] > 2:
+                    y[:, 2:] *= np.float32(vol)
+                outdata[:] = y * np.float32(env)
+            else:
+                y = rng.standard_normal(frames, dtype=np.float32) * np.float32(vol)
+                outdata[:, 0] = y * np.float32(env)
             return
 
         # Sweep mode.

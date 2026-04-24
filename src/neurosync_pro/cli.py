@@ -189,6 +189,32 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_noise(args: argparse.Namespace) -> int:
+    from neurosync_pro.audio.stream import StreamConfig, ToneSweepStream
+
+    channels = 2 if bool(args.stereo) else 1
+    s = ToneSweepStream(StreamConfig(sample_rate=int(args.sample_rate), channels=channels))
+    if channels == 2 and (args.volume_l is not None or args.volume_r is not None):
+        vl = float(args.volume_l) if args.volume_l is not None else float(args.volume)
+        vr = float(args.volume_r) if args.volume_r is not None else float(args.volume)
+        s.set_volume_lr(vl, vr)
+    else:
+        s.set_volume(float(args.volume))
+    s.set_fades(float(args.fade_in), float(args.fade_out))
+    s.start()
+    s.play_noise(seed=int(args.seed) if args.seed is not None else None)
+    try:
+        import time
+
+        time.sleep(float(args.duration))
+    finally:
+        s.idle()
+        # Give fade-out a moment to ramp down.
+        time.sleep(float(args.fade_out) + 0.05)
+        s.stop()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="neurosync-pro",
@@ -330,6 +356,18 @@ def build_parser() -> argparse.ArgumentParser:
     sw.add_argument("--fade-in", type=float, default=0.02)
     sw.add_argument("--fade-out", type=float, default=0.05)
     sw.set_defaults(func=cmd_sweep)
+
+    nz = sub.add_parser("noise", help="Realtime white noise via sounddevice (Windows MVP).")
+    nz.add_argument("--duration", type=float, default=5.0)
+    nz.add_argument("--volume", type=float, default=0.15)
+    nz.add_argument("--stereo", action="store_true", help="Use stereo output (2 channels).")
+    nz.add_argument("--volume-l", type=float, default=None, help="Left volume (stereo only).")
+    nz.add_argument("--volume-r", type=float, default=None, help="Right volume (stereo only).")
+    nz.add_argument("--seed", type=int, default=None, help="Noise RNG seed (for reproducibility).")
+    nz.add_argument("--sample-rate", type=int, default=48000)
+    nz.add_argument("--fade-in", type=float, default=0.02)
+    nz.add_argument("--fade-out", type=float, default=0.05)
+    nz.set_defaults(func=cmd_noise)
 
     sui = sub.add_parser("sweep-ui", help="GUI tone/sweep generator (requires .[gui] and .[audio]).")
     sui.set_defaults(func=cmd_sweep_ui)
