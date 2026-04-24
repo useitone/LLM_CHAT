@@ -69,26 +69,6 @@ def _iter_eeg(path: Path) -> Iterator[tuple[int, int]]:
             yield int(e.get("attention", 0)), int(e.get("meditation", 0))
 
 
-def _play_chime() -> None:
-    if sys.platform == "win32":
-        import winsound
-
-        fd, tmp = tempfile.mkstemp(suffix=".wav")
-        import os
-
-        os.close(fd)
-        p = Path(tmp)
-        try:
-            pcm = sine_pcm16_mono(880.0, 0.15, sample_rate=22050, volume=0.2)
-            write_wav_pcm16_mono(p, pcm, sample_rate=22050)
-            winsound.PlaySound(str(p), winsound.SND_FILENAME | winsound.SND_ASYNC)
-        finally:
-            try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-
 def _play_brief_pitch_hz(freq_hz: float, volume: float) -> None:
     """Short tone for biofeedback (Windows async WAV)."""
     if sys.platform != "win32":
@@ -114,13 +94,6 @@ def _play_brief_pitch_hz(freq_hz: float, volume: float) -> None:
 
 
 class MeditationMainWindow(QMainWindow):
-    PHASES = [
-        ("Вдох 4 счёта…", 4000),
-        ("Задержка…", 2000),
-        ("Выдох 6 счётов…", 6000),
-        ("Расслабление…", 2000),
-    ]
-
     def __init__(
         self,
         jsonl_path: Path | None = None,
@@ -136,7 +109,6 @@ class MeditationMainWindow(QMainWindow):
         self.setWindowTitle("NeuroSync Pro — медитация / концентрация (PoC)")
         self._bus = EventBus()
         self._api_server = None
-        self._phase_index = 0
         self._ble_address = (ble_address or "").strip() or None
         self._ble_init_hex = ble_init_hex
         self._ble_duration_s = ble_duration_s
@@ -246,11 +218,6 @@ class MeditationMainWindow(QMainWindow):
 
         cw = QWidget()
         lay = QVBoxLayout(cw)
-        self._hint = QLabel(self.PHASES[0][0])
-        self._hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        f = self._hint.font()
-        f.setPointSize(14)
-        self._hint.setFont(f)
         self._att = QProgressBar()
         self._att.setRange(0, 100)
         self._att.setFormat("Attention %v")
@@ -555,7 +522,6 @@ class MeditationMainWindow(QMainWindow):
 
         self._status = QLabel("")
         self._stats = QLabel("")
-        lay.addWidget(self._hint)
         lay.addWidget(self._src_label)
         lay.addWidget(self._stats)
         lay.addWidget(QLabel("Метрики:"))
@@ -604,16 +570,9 @@ class MeditationMainWindow(QMainWindow):
         lay.addWidget(self._bio_cb)
         self._bio_cb.toggled.connect(self._toggle_biofeedback)
         lay.addWidget(self._api_cb)
-        btn = QPushButton("Сигнал фазы (звук)")
-        btn.clicked.connect(_play_chime)
-        lay.addWidget(btn)
         lay.addWidget(self._status)
         self.setCentralWidget(cw)
         self.resize(520, 380)
-
-        self._phase_timer = QTimer(self)
-        self._phase_timer.timeout.connect(self._next_phase)
-        self._start_phase_duration(self.PHASES[0][1])
 
         self._eeg_timer = QTimer(self)
         self._eeg_timer.timeout.connect(self._eeg_tick)
@@ -1061,19 +1020,6 @@ class MeditationMainWindow(QMainWindow):
                 self._status.setText("BLE: поток активен")
             else:
                 self._status.setText("API выключен")
-
-    def _start_phase_duration(self, ms: int) -> None:
-        self._phase_timer.stop()
-        self._phase_timer.start(ms)
-
-    def _next_phase(self) -> None:
-        self._phase_timer.stop()
-        _play_chime()
-        self._phase_index = (self._phase_index + 1) % len(self.PHASES)
-        text, dur = self.PHASES[self._phase_index]
-        self._hint.setText(text)
-        self._bus.publish("meditation.phase", {"phase": self._phase_index, "text": text})
-        self._start_phase_duration(dur)
 
     def _eeg_tick(self) -> None:
         if self._eeg_it is None:
