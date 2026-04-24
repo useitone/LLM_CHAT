@@ -148,6 +148,11 @@ class MeditationMainWindow(QMainWindow):
         self._last_att = 0
         self._last_med = 0
         self._ble_selected_rssi: int | None = None
+        self._last_signal_quality: int | None = None
+        self._rssi_scan_thread: BleScanThread | None = None
+        self._rssi_timer = QTimer(self)
+        self._rssi_timer.setInterval(6000)
+        self._rssi_timer.timeout.connect(self._tick_rssi_scan)
 
         # EEG → Tone (audio biofeedback)
         self._eeg_tone_available = ToneSweepStream is not None
@@ -998,15 +1003,18 @@ class MeditationMainWindow(QMainWindow):
             parent=self,
         )
         th.metricsReady.connect(self._on_ble_metrics)
+        th.signalQualityReady.connect(self._on_ble_signal_quality)
         th.connectionFailed.connect(self._on_ble_failed)
         th.workerFinished.connect(self._on_ble_worker_finished)
         self._ble_thread = th
         th.start()
+        self._rssi_timer.start()
 
     def _stop_ble(self) -> None:
         if self._ble_thread is not None:
             self._ble_thread.request_stop()
             self._status.setText("BLE: остановка…")
+        self._rssi_timer.stop()
 
     def _on_ble_metrics(self, att: int, med: int) -> None:
         now = time.monotonic()
@@ -1024,6 +1032,12 @@ class MeditationMainWindow(QMainWindow):
         if self._status.text().startswith("BLE: подключение"):
             self._status.setText("BLE: поток активен")
 
+    def _on_ble_signal_quality(self, q: int) -> None:
+        try:
+            self._last_signal_quality = int(q)
+        except (TypeError, ValueError):
+            self._last_signal_quality = None
+
     def _on_ble_failed(self, msg: str) -> None:
         self._status.setText(f"BLE ошибка: {msg}")
 
@@ -1031,6 +1045,7 @@ class MeditationMainWindow(QMainWindow):
         self._ble_thread = None
         self._ble_start.setEnabled(True)
         self._ble_stop.setEnabled(False)
+        self._rssi_timer.stop()
         if not str(self._status.text()).startswith("BLE ошибка"):
             self._status.setText("BLE: отключено")
 
@@ -1136,8 +1151,37 @@ class MeditationMainWindow(QMainWindow):
 
         if self._ble_selected_rssi is not None:
             parts.append(f"RSSI {self._ble_selected_rssi}")
+        if self._last_signal_quality is not None:
+            parts.append(f"SQ {self._last_signal_quality}")
 
         self._stats.setText(" · ".join(parts))
+
+    def _tick_rssi_scan(self) -> None:
+        # Best-effort RSSI refresh via a short advertisement scan.
+        if not self._ble_address:
+            return
+        if self._rssi_scan_thread is not None and self._rssi_scan_thread.isRunning():
+            return
+        th = BleScanThread(scan_time_s=2.0, name_filter="", parent=self)
+        th.scanResult.connect(self._on_rssi_scan_result)
+        th.scanFailed.connect(lambda _msg: None)
+        self._rssi_scan_thread = th
+        th.start()
+
+    def _on_rssi_scan_result(self, rows: list) -> None:
+        self._rssi_scan_thread = None
+        addr = normalize_ble_address(self._ble_address or "")
+        best = None
+        for r in rows or []:
+            a = normalize_ble_address(str(r.get("address") or ""))
+            if a != addr:
+                continue
+            best = r.get("rssi")
+            break
+        try:
+            self._ble_selected_rssi = int(best) if best is not None else self._ble_selected_rssi
+        except (TypeError, ValueError):
+            pass
 
     def _apply_eeg_tone(self) -> None:
         if not self._eeg_tone_enabled:

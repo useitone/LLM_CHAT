@@ -14,6 +14,7 @@ class BleNotifyThread(QThread):
     """Decode BrainLink notify chunks and emit attention/meditation per EEG frame."""
 
     metricsReady = Signal(int, int)
+    signalQualityReady = Signal(int)
     connectionFailed = Signal(str)
     workerFinished = Signal()
 
@@ -47,6 +48,8 @@ class BleNotifyThread(QThread):
         def on_chunk(data: bytes) -> None:
             for frame in decoder.feed_chunk(data):
                 self.metricsReady.emit(frame.attention, frame.meditation)
+                if frame.signal_quality is not None:
+                    self.signalQualityReady.emit(int(frame.signal_quality))
 
         try:
             self._loop.run_until_complete(

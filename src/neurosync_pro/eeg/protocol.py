@@ -31,6 +31,7 @@ class ShortFrameDecoded:
 @dataclass
 class EegFrameDecoded:
     raw_hex: str
+    signal_quality: int | None
     attention: int
     meditation: int
     delta: int
@@ -150,6 +151,7 @@ class BrainLinkStateMachineParser:
         if self._checksum(self.payload) != self.checksum:
             return None
 
+        signal_quality: int | None = None
         attention = 0
         meditation = 0
         delta = theta = 0
@@ -163,7 +165,9 @@ class BrainLinkStateMachineParser:
             idx += 1
 
             if code == self.SIGNAL_CHECK_BYTE:
-                idx += 1  # skip signal quality byte
+                if idx < 32:
+                    signal_quality = int(self.payload[idx])
+                idx += 1
             elif code == self.EEG_CHECK_BYTE:
                 if idx >= 32:
                     break
@@ -202,6 +206,7 @@ class BrainLinkStateMachineParser:
 
         return EegFrameDecoded(
             raw_hex=bytes(self.payload[:32]).hex(),
+            signal_quality=signal_quality,
             attention=attention,
             meditation=meditation,
             delta=delta,
