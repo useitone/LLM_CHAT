@@ -30,6 +30,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -96,6 +98,10 @@ class MeditationMainWindow(QMainWindow):
         self._last_med = 0
         self._ble_selected_rssi: int | None = None
         self._last_signal_quality: int | None = None
+        self._last_bands: dict[str, int] | None = None
+        self._bands_full = False
+        self._bands_last_ui_at = 0.0
+        self._bands_min_ui_s = 0.25
         self._rssi_scan_thread: BleScanThread | None = None
         self._rssi_timer = QTimer(self)
         self._rssi_timer.setInterval(6000)
@@ -157,6 +163,9 @@ class MeditationMainWindow(QMainWindow):
         self._eeg_bin_delta_hz = 8.0
         self._eeg_bin_last_delta_at = 0.0
 
+        # Generator monitor (UI-only; mirrors what we send to audio engine).
+        self._genmon_text = ""
+
         # Link/quality stats (session time, Hz, last sample age).
         self._session_started_at: float | None = None
         self._last_metric_at: float | None = None
@@ -192,7 +201,42 @@ class MeditationMainWindow(QMainWindow):
             self._session_log_file = session_log_path.open("a", encoding="utf-8")
 
         cw = QWidget()
-        lay = QVBoxLayout(cw)
+        root = QHBoxLayout(cw)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(splitter, 1)
+
+        # Left: controls (scrollable).
+        left_widget = QWidget()
+        left_lay = QVBoxLayout(left_widget)
+        left_lay.setContentsMargins(8, 8, 8, 8)
+        left_lay.setSpacing(6)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setWidget(left_widget)
+
+        # Middle: indicators/plots (non-scroll; uses splitters/tabs later).
+        mid_widget = QWidget()
+        mid_lay = QVBoxLayout(mid_widget)
+        mid_lay.setContentsMargins(8, 8, 8, 8)
+        mid_lay.setSpacing(6)
+
+        # Right: programmer placeholder.
+        right_widget = QWidget()
+        right_lay = QVBoxLayout(right_widget)
+        right_lay.setContentsMargins(8, 8, 8, 8)
+        right_lay.setSpacing(6)
+        right_lay.addWidget(QLabel("Программатор (скоро)"))
+        right_lay.addStretch(1)
+
+        splitter.addWidget(left_scroll)
+        splitter.addWidget(mid_widget)
+        splitter.addWidget(right_widget)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(2, 2)
         self._att = QProgressBar()
         self._att.setRange(0, 100)
         self._att.setFormat("Attention %v")
@@ -492,55 +536,80 @@ class MeditationMainWindow(QMainWindow):
 
         self._status = QLabel("")
         self._stats = QLabel("")
-        lay.addWidget(self._src_label)
-        lay.addWidget(self._stats)
-        lay.addWidget(QLabel("Метрики:"))
-        lay.addWidget(self._att)
-        lay.addWidget(self._med)
+
+        # Left panel content.
+        left_lay.addWidget(self._src_label)
+        left_lay.addWidget(self._stats)
+        left_lay.addWidget(QLabel("Метрики:"))
+        left_lay.addWidget(self._att)
+        left_lay.addWidget(self._med)
         sess_row = QWidget()
         sess_lay = QHBoxLayout(sess_row)
         sess_lay.setContentsMargins(0, 0, 0, 0)
         sess_lay.addWidget(self._session_btn)
         sess_lay.addWidget(self._record_btn)
         sess_lay.addStretch(1)
-        lay.addWidget(sess_row)
-        lay.addWidget(self._eeg_tone_cb)
-        lay.addWidget(self._eeg_tone_box)
-        lay.addWidget(self._eeg_bin_cb)
-        lay.addWidget(self._eeg_bin_box)
+        left_lay.addWidget(sess_row)
+        left_lay.addWidget(self._eeg_tone_cb)
+        left_lay.addWidget(self._eeg_tone_box)
+        left_lay.addWidget(self._eeg_bin_cb)
+        left_lay.addWidget(self._eeg_bin_box)
+
+        # Middle panel: plot controls + plots.
         plot_row = QWidget()
         plot_row_lay = QHBoxLayout(plot_row)
         plot_row_lay.setContentsMargins(0, 0, 0, 0)
         plot_row_lay.addWidget(self._plot_cb)
         plot_row_lay.addStretch(1)
         plot_row_lay.addWidget(self._plot_clear_btn)
-        lay.addWidget(plot_row)
+        mid_lay.addWidget(plot_row)
         if self._plot_available:
-            self._init_plot_widgets(lay)
+            self._init_plot_widgets(mid_lay)
+
+        # Bands: compact by default (cheap UI/CPU) with optional Full toggle.
+        self._bands_box = QGroupBox("Bands (Compact)")
+        mid_lay.addWidget(self._bands_box)
+        bform = QFormLayout(self._bands_box)
+        self._bands_full_cb = QCheckBox("Full (8 линий)")
+        self._bands_full_cb.setChecked(False)
+        self._bands_full_cb.toggled.connect(self._toggle_bands_full)
+        self._bands_line = QLabel("нет данных")
+        self._bands_line.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        bform.addRow("", self._bands_full_cb)
+        bform.addRow("Bands", self._bands_line)
+
+        self._genmon_box = QGroupBox("Generator monitor")
+        mid_lay.addWidget(self._genmon_box)
+        gm_form = QFormLayout(self._genmon_box)
+        self._genmon_line = QLabel("idle")
+        self._genmon_line.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        gm_form.addRow("State", self._genmon_line)
+        mid_lay.addStretch(1)
         if self._ble_address:
             row = QWidget()
             h = QHBoxLayout(row)
             h.setContentsMargins(0, 0, 0, 0)
             h.addWidget(self._ble_start)
             h.addWidget(self._ble_stop)
-            lay.addWidget(row)
+            left_lay.addWidget(row)
         else:
             scan_row = QWidget()
             sh = QHBoxLayout(scan_row)
             sh.setContentsMargins(0, 0, 0, 0)
             sh.addWidget(self._ble_scan_btn)
             sh.addWidget(self._ble_devices, 1)
-            lay.addWidget(scan_row)
+            left_lay.addWidget(scan_row)
             btn_row = QWidget()
             bh = QHBoxLayout(btn_row)
             bh.setContentsMargins(0, 0, 0, 0)
             bh.addWidget(self._ble_start)
             bh.addWidget(self._ble_stop)
-            lay.addWidget(btn_row)
-        lay.addWidget(self._api_cb)
-        lay.addWidget(self._status)
+            left_lay.addWidget(btn_row)
+        left_lay.addWidget(self._api_cb)
+        left_lay.addWidget(self._status)
+        left_lay.addStretch(1)
         self.setCentralWidget(cw)
-        self.resize(520, 380)
+        self.resize(1180, 700)
 
         self._eeg_timer = QTimer(self)
         self._eeg_timer.timeout.connect(self._eeg_tick)
@@ -919,6 +988,7 @@ class MeditationMainWindow(QMainWindow):
         )
         th.metricsReady.connect(self._on_ble_metrics)
         th.signalQualityReady.connect(self._on_ble_signal_quality)
+        th.bandsReady.connect(self._on_ble_bands)
         th.connectionFailed.connect(self._on_ble_failed)
         th.workerFinished.connect(self._on_ble_worker_finished)
         self._ble_thread = th
@@ -952,6 +1022,31 @@ class MeditationMainWindow(QMainWindow):
             self._last_signal_quality = int(q)
         except (TypeError, ValueError):
             self._last_signal_quality = None
+
+    def _on_ble_bands(
+        self,
+        delta: int,
+        theta: int,
+        low_alpha: int,
+        high_alpha: int,
+        low_beta: int,
+        high_beta: int,
+        low_gamma: int,
+        high_gamma: int,
+        _att: int,
+        _med: int,
+    ) -> None:
+        self._last_bands = {
+            "delta": int(delta),
+            "theta": int(theta),
+            "low_alpha": int(low_alpha),
+            "high_alpha": int(high_alpha),
+            "low_beta": int(low_beta),
+            "high_beta": int(high_beta),
+            "low_gamma": int(low_gamma),
+            "high_gamma": int(high_gamma),
+        }
+        self._refresh_bands_ui()
 
     def _on_ble_failed(self, msg: str) -> None:
         self._status.setText(f"BLE ошибка: {msg}")
@@ -1057,6 +1152,37 @@ class MeditationMainWindow(QMainWindow):
 
         self._stats.setText(" · ".join(parts))
 
+    def _toggle_bands_full(self, on: bool) -> None:
+        self._bands_full = bool(on)
+        self._bands_box.setTitle("Bands (Full)" if self._bands_full else "Bands (Compact)")
+        self._refresh_bands_ui(force=True)
+
+    def _refresh_bands_ui(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self._bands_last_ui_at) < self._bands_min_ui_s:
+            return
+        self._bands_last_ui_at = now
+
+        b = self._last_bands
+        if not b:
+            self._bands_line.setText("нет данных")
+            return
+
+        if self._bands_full:
+            self._bands_line.setText(
+                "δ={delta} θ={theta} αL={low_alpha} αH={high_alpha} βL={low_beta} βH={high_beta} γL={low_gamma} γH={high_gamma}".format(
+                    **b
+                )
+            )
+            return
+
+        alpha = int(b["low_alpha"]) + int(b["high_alpha"])
+        beta = int(b["low_beta"]) + int(b["high_beta"])
+        gamma = int(b["low_gamma"]) + int(b["high_gamma"])
+        self._bands_line.setText(
+            f"δ={b['delta']}  θ={b['theta']}  α={alpha}  β={beta}  γ={gamma}"
+        )
+
     def _tick_rssi_scan(self) -> None:
         # Best-effort RSSI refresh via a short advertisement scan.
         if not self._ble_address:
@@ -1103,6 +1229,9 @@ class MeditationMainWindow(QMainWindow):
                 else:
                     if self._ensure_eeg_tone_stream(channels=2):
                         self._eeg_tone_stream.set_volume_lr(float(self._eeg_tone_v_l), float(self._eeg_tone_v_r))
+                        self._genmon_line.setText(
+                            f"EEG→Tone(stereo) fL={self._eeg_tone_f_l:.1f}Hz fR={self._eeg_tone_f_r:.1f}Hz  vL={self._eeg_tone_v_l:.3f} vR={self._eeg_tone_v_r:.3f}"
+                        )
                 return
             self._eeg_tone_vol = self._eeg_tone_vol * (1.0 - self._eeg_tone_alpha)
             if self._eeg_tone_vol < 0.005:
@@ -1110,6 +1239,9 @@ class MeditationMainWindow(QMainWindow):
             else:
                 if self._ensure_eeg_tone_stream(channels=1):
                     self._eeg_tone_stream.set_volume(float(self._eeg_tone_vol))
+                    self._genmon_line.setText(
+                        f"EEG→Tone(mono) v={self._eeg_tone_vol:.3f}"
+                    )
             return
 
         # Map metrics.
@@ -1207,6 +1339,9 @@ class MeditationMainWindow(QMainWindow):
                 return
             self._eeg_tone_stream.set_volume_lr(float(self._eeg_tone_v_l), float(self._eeg_tone_v_r))
             self._eeg_tone_stream.play_binaural(float(self._eeg_tone_f_l), float(self._eeg_tone_f_r))
+            self._genmon_line.setText(
+                f"EEG→Tone(stereo) fL={self._eeg_tone_f_l:.1f}Hz fR={self._eeg_tone_f_r:.1f}Hz  vL={self._eeg_tone_v_l:.3f} vR={self._eeg_tone_v_r:.3f}"
+            )
             return
 
         freq_src = med if self._eeg_tone_freq_src == "meditation" else att
@@ -1225,6 +1360,9 @@ class MeditationMainWindow(QMainWindow):
             return
         self._eeg_tone_stream.set_volume(float(self._eeg_tone_vol))
         self._eeg_tone_stream.play_tone(float(self._eeg_tone_f_hz))
+        self._genmon_line.setText(
+            f"EEG→Tone(mono) f={self._eeg_tone_f_hz:.1f}Hz  v={self._eeg_tone_vol:.3f}"
+        )
 
     def _apply_eeg_binaural(self) -> None:
         if not self._eeg_bin_enabled:
@@ -1258,6 +1396,9 @@ class MeditationMainWindow(QMainWindow):
             return
         self._eeg_bin_stream.set_volume(float(self._eeg_bin_fixed_vol))
         self._eeg_bin_stream.play_binaural(left, right)
+        self._genmon_line.setText(
+            f"EEG→Binaural fL={left:.1f}Hz fR={right:.1f}Hz  Δf={float(self._eeg_bin_delta_hz):.2f}Hz  v={float(self._eeg_bin_fixed_vol):.3f}"
+        )
 
 
 def run_meditation_poc(

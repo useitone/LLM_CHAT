@@ -15,6 +15,7 @@ class BleNotifyThread(QThread):
 
     metricsReady = Signal(int, int)
     signalQualityReady = Signal(int)
+    bandsReady = Signal(int, int, int, int, int, int, int, int, int, int)
     connectionFailed = Signal(str)
     workerFinished = Signal()
 
@@ -50,6 +51,18 @@ class BleNotifyThread(QThread):
                 self.metricsReady.emit(frame.attention, frame.meditation)
                 if frame.signal_quality is not None:
                     self.signalQualityReady.emit(int(frame.signal_quality))
+                self.bandsReady.emit(
+                    int(frame.delta),
+                    int(frame.theta),
+                    int(frame.low_alpha),
+                    int(frame.high_alpha),
+                    int(frame.low_beta),
+                    int(frame.high_beta),
+                    int(frame.low_gamma),
+                    int(frame.high_gamma),
+                    int(frame.attention),
+                    int(frame.meditation),
+                )
 
         try:
             self._loop.run_until_complete(
