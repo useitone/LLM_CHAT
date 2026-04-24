@@ -40,7 +40,6 @@ except Exception:  # pragma: no cover - optional addon
     QChart = QChartView = QLineSeries = QValueAxis = None  # type: ignore[misc,assignment]
 
 from neurosync_pro.agent.server import start_agent_api, stop_agent_api
-from neurosync_pro.audio.engine import sine_pcm16_mono, write_wav_pcm16_mono
 from neurosync_pro.bus import EventBus
 from neurosync_pro.eeg.ble_stream import normalize_ble_address
 from neurosync_pro.ui.ble_thread import BleNotifyThread, BleScanThread
@@ -67,30 +66,6 @@ def _iter_eeg(path: Path) -> Iterator[tuple[int, int]]:
             if not isinstance(e, dict):
                 continue
             yield int(e.get("attention", 0)), int(e.get("meditation", 0))
-
-
-def _play_brief_pitch_hz(freq_hz: float, volume: float) -> None:
-    """Short tone for biofeedback (Windows async WAV)."""
-    if sys.platform != "win32":
-        return
-    import winsound
-
-    fd, tmp = tempfile.mkstemp(suffix=".wav")
-    import os
-
-    os.close(fd)
-    p = Path(tmp)
-    try:
-        f = max(90.0, min(1200.0, freq_hz))
-        v = max(0.02, min(0.35, volume))
-        pcm = sine_pcm16_mono(f, 0.08, sample_rate=22050, volume=v)
-        write_wav_pcm16_mono(p, pcm, sample_rate=22050)
-        winsound.PlaySound(str(p), winsound.SND_FILENAME | winsound.SND_ASYNC)
-    finally:
-        try:
-            p.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 class MeditationMainWindow(QMainWindow):
@@ -249,11 +224,6 @@ class MeditationMainWindow(QMainWindow):
         self._plot_timer = QTimer(self)
         self._plot_timer.setInterval(120)
         self._plot_timer.timeout.connect(self._plot_tick)
-
-        self._bio_cb = QCheckBox("Тон обратной связи (высота ~ Attention, громкость ~ Meditation)")
-        self._bio_timer = QTimer(self)
-        self._bio_timer.setInterval(700)
-        self._bio_timer.timeout.connect(self._biofeedback_tick)
 
         # Session logging controls (new session file per run; avoids append confusion).
         self._session_btn = QPushButton("Новая сессия (лог)")
@@ -567,8 +537,6 @@ class MeditationMainWindow(QMainWindow):
             bh.addWidget(self._ble_start)
             bh.addWidget(self._ble_stop)
             lay.addWidget(btn_row)
-        lay.addWidget(self._bio_cb)
-        self._bio_cb.toggled.connect(self._toggle_biofeedback)
         lay.addWidget(self._api_cb)
         lay.addWidget(self._status)
         self.setCentralWidget(cw)
@@ -912,18 +880,6 @@ class MeditationMainWindow(QMainWindow):
         self._series_att.replace([QPointF(x, y) for x, y in pts_att])
         self._series_med.replace([QPointF(x, y) for x, y in pts_med])
 
-    def _toggle_biofeedback(self, on: bool) -> None:
-        if on:
-            self._bio_timer.start()
-        else:
-            self._bio_timer.stop()
-
-    def _biofeedback_tick(self) -> None:
-        att, med = self._last_att, self._last_med
-        freq = 220.0 + float(att) * 4.5
-        vol = 0.04 + 0.22 * (float(med) / 100.0)
-        _play_brief_pitch_hz(freq, vol)
-
     def _append_session_log(self, att: int, med: int) -> None:
         if not self._session_log_active:
             return
@@ -1045,7 +1001,6 @@ class MeditationMainWindow(QMainWindow):
         self._apply_eeg_binaural()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
-        self._bio_timer.stop()
         self._stats_timer.stop()
         self._stop_eeg_tone()
         self._stop_eeg_binaural()
