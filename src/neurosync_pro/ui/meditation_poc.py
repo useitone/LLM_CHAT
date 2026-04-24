@@ -165,6 +165,29 @@ class MeditationMainWindow(QMainWindow):
         self._eeg_tone_freq_src = "attention"  # attention|meditation
         self._eeg_tone_vol_src = "meditation"  # off|attention|meditation
         self._eeg_tone_fixed_vol = 0.08
+        self._eeg_tone_mode = "mono"  # mono|stereo
+
+        # EEG → Tone stereo mapping (L/R independent)
+        self._eeg_tone_l_min_hz = 100.0
+        self._eeg_tone_l_max_hz = 1000.0
+        self._eeg_tone_l_freq_src = "attention"  # attention|meditation|off
+        self._eeg_tone_l_fixed_hz = 440.0
+        self._eeg_tone_l_min_vol = 0.02
+        self._eeg_tone_l_max_vol = 0.20
+        self._eeg_tone_l_vol_src = "off"  # off|attention|meditation|freq_inv
+        self._eeg_tone_l_fixed_vol = 0.08
+        self._eeg_tone_r_min_hz = 100.0
+        self._eeg_tone_r_max_hz = 1000.0
+        self._eeg_tone_r_freq_src = "meditation"  # attention|meditation|off
+        self._eeg_tone_r_fixed_hz = 440.0
+        self._eeg_tone_r_min_vol = 0.02
+        self._eeg_tone_r_max_vol = 0.20
+        self._eeg_tone_r_vol_src = "off"  # off|attention|meditation|freq_inv
+        self._eeg_tone_r_fixed_vol = 0.08
+        self._eeg_tone_f_l = 440.0
+        self._eeg_tone_f_r = 440.0
+        self._eeg_tone_v_l = 0.0
+        self._eeg_tone_v_r = 0.0
 
         # EEG → Binaural (stereo, random delta)
         self._eeg_bin_available = ToneSweepStream is not None
@@ -283,6 +306,11 @@ class MeditationMainWindow(QMainWindow):
         self._eeg_tone_box.setEnabled(self._eeg_tone_available)
         self._eeg_tone_box.setVisible(False)
         form = QFormLayout(self._eeg_tone_box)
+        self._tone_mode = QComboBox()
+        self._tone_mode.addItem("Mono", userData="mono")
+        self._tone_mode.addItem("Stereo (L/R)", userData="stereo")
+        self._tone_mode.setCurrentIndex(0)
+        self._tone_mode.currentIndexChanged.connect(self._tone_mode_changed)
         self._tone_min_hz = QDoubleSpinBox()
         self._tone_min_hz.setRange(1.0, 20000.0)
         self._tone_min_hz.setValue(self._eeg_tone_min_hz)
@@ -323,6 +351,127 @@ class MeditationMainWindow(QMainWindow):
         self._tone_fixed_vol.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_fixed_vol", float(v)))
         self._tone_fixed_vol.setEnabled(False)
 
+        self._eeg_tone_stereo_box = QGroupBox("Stereo (L/R) mapping")
+        self._eeg_tone_stereo_box.setVisible(False)
+        stereo_lay = QHBoxLayout(self._eeg_tone_stereo_box)
+        stereo_lay.setContentsMargins(0, 0, 0, 0)
+
+        self._tone_l_box = QGroupBox("Left (L)")
+        lf = QFormLayout(self._tone_l_box)
+        self._tone_l_min_hz = QDoubleSpinBox()
+        self._tone_l_min_hz.setRange(1.0, 20000.0)
+        self._tone_l_min_hz.setValue(self._eeg_tone_l_min_hz)
+        self._tone_l_min_hz.setSuffix(" Hz")
+        self._tone_l_min_hz.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_l_min_hz", float(v)))
+        self._tone_l_max_hz = QDoubleSpinBox()
+        self._tone_l_max_hz.setRange(1.0, 20000.0)
+        self._tone_l_max_hz.setValue(self._eeg_tone_l_max_hz)
+        self._tone_l_max_hz.setSuffix(" Hz")
+        self._tone_l_max_hz.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_l_max_hz", float(v)))
+        self._tone_l_freq_src = QComboBox()
+        self._tone_l_freq_src.addItem("Attention → Hz", userData="attention")
+        self._tone_l_freq_src.addItem("Meditation → Hz", userData="meditation")
+        self._tone_l_freq_src.addItem("Off (fixed Hz)", userData="off")
+        self._tone_l_freq_src.setCurrentIndex(0)
+        self._tone_l_freq_src.currentIndexChanged.connect(self._tone_l_freq_src_changed)
+        self._tone_l_fixed_hz = QDoubleSpinBox()
+        self._tone_l_fixed_hz.setRange(1.0, 20000.0)
+        self._tone_l_fixed_hz.setValue(self._eeg_tone_l_fixed_hz)
+        self._tone_l_fixed_hz.setSuffix(" Hz")
+        self._tone_l_fixed_hz.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_l_fixed_hz", float(v)))
+        self._tone_l_fixed_hz.setEnabled(False)
+        self._tone_l_min_vol = QDoubleSpinBox()
+        self._tone_l_min_vol.setRange(0.0, 1.0)
+        self._tone_l_min_vol.setSingleStep(0.01)
+        self._tone_l_min_vol.setValue(self._eeg_tone_l_min_vol)
+        self._tone_l_min_vol.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_l_min_vol", float(v)))
+        self._tone_l_max_vol = QDoubleSpinBox()
+        self._tone_l_max_vol.setRange(0.0, 1.0)
+        self._tone_l_max_vol.setSingleStep(0.01)
+        self._tone_l_max_vol.setValue(self._eeg_tone_l_max_vol)
+        self._tone_l_max_vol.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_l_max_vol", float(v)))
+        self._tone_l_vol_src = QComboBox()
+        self._tone_l_vol_src.addItem("Volume: Off (fixed)", userData="off")
+        self._tone_l_vol_src.addItem("Freq → Volume (inverted, log)", userData="freq_inv")
+        self._tone_l_vol_src.addItem("Meditation → Volume", userData="meditation")
+        self._tone_l_vol_src.addItem("Attention → Volume", userData="attention")
+        self._tone_l_vol_src.setCurrentIndex(0)
+        self._tone_l_vol_src.currentIndexChanged.connect(self._tone_l_vol_src_changed)
+        self._tone_l_fixed_vol = QDoubleSpinBox()
+        self._tone_l_fixed_vol.setRange(0.0, 1.0)
+        self._tone_l_fixed_vol.setSingleStep(0.01)
+        self._tone_l_fixed_vol.setValue(self._eeg_tone_l_fixed_vol)
+        self._tone_l_fixed_vol.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_l_fixed_vol", float(v)))
+        self._tone_l_fixed_vol.setEnabled(True)
+        lf.addRow("Hz min", self._tone_l_min_hz)
+        lf.addRow("Hz max", self._tone_l_max_hz)
+        lf.addRow("Freq source", self._tone_l_freq_src)
+        lf.addRow("Fixed Hz", self._tone_l_fixed_hz)
+        lf.addRow("Vol min", self._tone_l_min_vol)
+        lf.addRow("Vol max", self._tone_l_max_vol)
+        lf.addRow("Vol source", self._tone_l_vol_src)
+        lf.addRow("Fixed vol", self._tone_l_fixed_vol)
+
+        self._tone_r_box = QGroupBox("Right (R)")
+        rf = QFormLayout(self._tone_r_box)
+        self._tone_r_min_hz = QDoubleSpinBox()
+        self._tone_r_min_hz.setRange(1.0, 20000.0)
+        self._tone_r_min_hz.setValue(self._eeg_tone_r_min_hz)
+        self._tone_r_min_hz.setSuffix(" Hz")
+        self._tone_r_min_hz.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_r_min_hz", float(v)))
+        self._tone_r_max_hz = QDoubleSpinBox()
+        self._tone_r_max_hz.setRange(1.0, 20000.0)
+        self._tone_r_max_hz.setValue(self._eeg_tone_r_max_hz)
+        self._tone_r_max_hz.setSuffix(" Hz")
+        self._tone_r_max_hz.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_r_max_hz", float(v)))
+        self._tone_r_freq_src = QComboBox()
+        self._tone_r_freq_src.addItem("Attention → Hz", userData="attention")
+        self._tone_r_freq_src.addItem("Meditation → Hz", userData="meditation")
+        self._tone_r_freq_src.addItem("Off (fixed Hz)", userData="off")
+        self._tone_r_freq_src.setCurrentIndex(1)
+        self._tone_r_freq_src.currentIndexChanged.connect(self._tone_r_freq_src_changed)
+        self._tone_r_fixed_hz = QDoubleSpinBox()
+        self._tone_r_fixed_hz.setRange(1.0, 20000.0)
+        self._tone_r_fixed_hz.setValue(self._eeg_tone_r_fixed_hz)
+        self._tone_r_fixed_hz.setSuffix(" Hz")
+        self._tone_r_fixed_hz.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_r_fixed_hz", float(v)))
+        self._tone_r_fixed_hz.setEnabled(False)
+        self._tone_r_min_vol = QDoubleSpinBox()
+        self._tone_r_min_vol.setRange(0.0, 1.0)
+        self._tone_r_min_vol.setSingleStep(0.01)
+        self._tone_r_min_vol.setValue(self._eeg_tone_r_min_vol)
+        self._tone_r_min_vol.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_r_min_vol", float(v)))
+        self._tone_r_max_vol = QDoubleSpinBox()
+        self._tone_r_max_vol.setRange(0.0, 1.0)
+        self._tone_r_max_vol.setSingleStep(0.01)
+        self._tone_r_max_vol.setValue(self._eeg_tone_r_max_vol)
+        self._tone_r_max_vol.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_r_max_vol", float(v)))
+        self._tone_r_vol_src = QComboBox()
+        self._tone_r_vol_src.addItem("Volume: Off (fixed)", userData="off")
+        self._tone_r_vol_src.addItem("Freq → Volume (inverted, log)", userData="freq_inv")
+        self._tone_r_vol_src.addItem("Meditation → Volume", userData="meditation")
+        self._tone_r_vol_src.addItem("Attention → Volume", userData="attention")
+        self._tone_r_vol_src.setCurrentIndex(0)
+        self._tone_r_vol_src.currentIndexChanged.connect(self._tone_r_vol_src_changed)
+        self._tone_r_fixed_vol = QDoubleSpinBox()
+        self._tone_r_fixed_vol.setRange(0.0, 1.0)
+        self._tone_r_fixed_vol.setSingleStep(0.01)
+        self._tone_r_fixed_vol.setValue(self._eeg_tone_r_fixed_vol)
+        self._tone_r_fixed_vol.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_r_fixed_vol", float(v)))
+        self._tone_r_fixed_vol.setEnabled(True)
+        rf.addRow("Hz min", self._tone_r_min_hz)
+        rf.addRow("Hz max", self._tone_r_max_hz)
+        rf.addRow("Freq source", self._tone_r_freq_src)
+        rf.addRow("Fixed Hz", self._tone_r_fixed_hz)
+        rf.addRow("Vol min", self._tone_r_min_vol)
+        rf.addRow("Vol max", self._tone_r_max_vol)
+        rf.addRow("Vol source", self._tone_r_vol_src)
+        rf.addRow("Fixed vol", self._tone_r_fixed_vol)
+
+        stereo_lay.addWidget(self._tone_l_box, 1)
+        stereo_lay.addWidget(self._tone_r_box, 1)
+
+        form.addRow("Mode", self._tone_mode)
         form.addRow("Hz min", self._tone_min_hz)
         form.addRow("Hz max", self._tone_max_hz)
         form.addRow("Freq source", self._tone_freq_src)
@@ -330,6 +479,7 @@ class MeditationMainWindow(QMainWindow):
         form.addRow("Vol max", self._tone_max_vol)
         form.addRow("Vol source", self._tone_vol_src)
         form.addRow("Fixed vol", self._tone_fixed_vol)
+        form.addRow(self._eeg_tone_stereo_box)
 
         self._eeg_bin_cb = QCheckBox("EEG → Binaural (stereo, random Δf)")
         self._eeg_bin_cb.setEnabled(self._eeg_bin_available)
@@ -472,6 +622,7 @@ class MeditationMainWindow(QMainWindow):
     def _toggle_eeg_tone(self, on: bool) -> None:
         self._eeg_tone_enabled = bool(on)
         self._eeg_tone_box.setVisible(self._eeg_tone_enabled)
+        self._eeg_tone_stereo_box.setVisible(self._eeg_tone_enabled and self._eeg_tone_mode == "stereo")
         if self._eeg_tone_enabled and self._eeg_bin_enabled:
             self._eeg_bin_cb.setChecked(False)
         if not self._eeg_tone_enabled:
@@ -487,6 +638,37 @@ class MeditationMainWindow(QMainWindow):
         if data in ("off", "attention", "meditation"):
             self._eeg_tone_vol_src = str(data)
         self._tone_fixed_vol.setEnabled(self._eeg_tone_vol_src == "off")
+
+    def _tone_mode_changed(self, _idx: int) -> None:
+        data = self._tone_mode.currentData()
+        if data in ("mono", "stereo"):
+            self._eeg_tone_mode = str(data)
+        self._eeg_tone_stereo_box.setVisible(self._eeg_tone_enabled and self._eeg_tone_mode == "stereo")
+        self._stop_eeg_tone()
+
+    def _tone_l_freq_src_changed(self, _idx: int) -> None:
+        data = self._tone_l_freq_src.currentData()
+        if data in ("attention", "meditation", "off"):
+            self._eeg_tone_l_freq_src = str(data)
+        self._tone_l_fixed_hz.setEnabled(self._eeg_tone_l_freq_src == "off")
+
+    def _tone_r_freq_src_changed(self, _idx: int) -> None:
+        data = self._tone_r_freq_src.currentData()
+        if data in ("attention", "meditation", "off"):
+            self._eeg_tone_r_freq_src = str(data)
+        self._tone_r_fixed_hz.setEnabled(self._eeg_tone_r_freq_src == "off")
+
+    def _tone_l_vol_src_changed(self, _idx: int) -> None:
+        data = self._tone_l_vol_src.currentData()
+        if data in ("off", "attention", "meditation", "freq_inv"):
+            self._eeg_tone_l_vol_src = str(data)
+        self._tone_l_fixed_vol.setEnabled(self._eeg_tone_l_vol_src == "off")
+
+    def _tone_r_vol_src_changed(self, _idx: int) -> None:
+        data = self._tone_r_vol_src.currentData()
+        if data in ("off", "attention", "meditation", "freq_inv"):
+            self._eeg_tone_r_vol_src = str(data)
+        self._tone_r_fixed_vol.setEnabled(self._eeg_tone_r_vol_src == "off")
 
     def _toggle_eeg_binaural(self, on: bool) -> None:
         self._eeg_bin_enabled = bool(on)
@@ -525,12 +707,13 @@ class MeditationMainWindow(QMainWindow):
             except Exception:
                 pass
 
-    def _ensure_eeg_tone_stream(self) -> bool:
+    def _ensure_eeg_tone_stream(self, *, channels: int) -> bool:
         if not self._eeg_tone_available:
             return False
-        if self._eeg_tone_stream is None:
+        if self._eeg_tone_stream is None or int(getattr(self._eeg_tone_stream, "cfg").channels) != int(channels):
+            self._stop_eeg_tone()
             try:
-                self._eeg_tone_stream = ToneSweepStream(StreamConfig(sample_rate=48000))
+                self._eeg_tone_stream = ToneSweepStream(StreamConfig(sample_rate=48000, channels=int(channels)))
                 self._eeg_tone_stream.set_fades(0.02, 0.08)
                 self._eeg_tone_stream.start()
             except Exception as exc:
@@ -966,17 +1149,121 @@ class MeditationMainWindow(QMainWindow):
 
         # Failsafe: if data is stale, fade volume down and stop.
         if self._last_metric_at is None or (now - self._last_metric_at) > 3.0:
+            if self._eeg_tone_mode == "stereo":
+                a = self._eeg_tone_alpha
+                self._eeg_tone_v_l = self._eeg_tone_v_l * (1.0 - a)
+                self._eeg_tone_v_r = self._eeg_tone_v_r * (1.0 - a)
+                if max(self._eeg_tone_v_l, self._eeg_tone_v_r) < 0.005:
+                    self._stop_eeg_tone()
+                else:
+                    if self._ensure_eeg_tone_stream(channels=2):
+                        self._eeg_tone_stream.set_volume_lr(float(self._eeg_tone_v_l), float(self._eeg_tone_v_r))
+                return
             self._eeg_tone_vol = self._eeg_tone_vol * (1.0 - self._eeg_tone_alpha)
             if self._eeg_tone_vol < 0.005:
                 self._stop_eeg_tone()
             else:
-                if self._ensure_eeg_tone_stream():
+                if self._ensure_eeg_tone_stream(channels=1):
                     self._eeg_tone_stream.set_volume(float(self._eeg_tone_vol))
             return
 
         # Map metrics.
         att = float(self._last_att) / 100.0
         med = float(self._last_med) / 100.0
+        a = self._eeg_tone_alpha
+
+        def _metric(kind: str) -> float:
+            if kind == "meditation":
+                return med
+            if kind == "attention":
+                return att
+            return 0.0
+
+        def _map_freq(src: str, *, min_hz: float, max_hz: float, fixed_hz: float) -> float:
+            if src == "off":
+                return float(fixed_hz)
+            x = _metric(src)
+            lo = float(min_hz)
+            hi = float(max_hz)
+            if hi < lo:
+                lo, hi = hi, lo
+            return lo + (hi - lo) * float(x)
+
+        def _map_vol(
+            src: str,
+            *,
+            min_vol: float,
+            max_vol: float,
+            fixed_vol: float,
+            freq_hz: float,
+            fmin_hz: float,
+            fmax_hz: float,
+        ) -> float:
+            if src == "off":
+                return float(fixed_vol)
+            if src == "freq_inv":
+                lo = max(1.0, float(fmin_hz))
+                hi = max(lo + 1e-6, float(fmax_hz))
+                if hi < lo:
+                    lo, hi = hi, lo
+                f = max(lo, min(hi, float(freq_hz)))
+                x = math.log(f / lo) / max(1e-12, math.log(hi / lo))
+                x = 0.0 if x < 0.0 else 1.0 if x > 1.0 else float(x)
+                vv_lo = float(min_vol)
+                vv_hi = float(max_vol)
+                if vv_hi < vv_lo:
+                    vv_lo, vv_hi = vv_hi, vv_lo
+                return vv_hi - (vv_hi - vv_lo) * x
+            x = _metric(src)
+            vv_lo = float(min_vol)
+            vv_hi = float(max_vol)
+            if vv_hi < vv_lo:
+                vv_lo, vv_hi = vv_hi, vv_lo
+            return vv_lo + (vv_hi - vv_lo) * float(x)
+
+        if self._eeg_tone_mode == "stereo":
+            f_l_t = _map_freq(
+                self._eeg_tone_l_freq_src,
+                min_hz=self._eeg_tone_l_min_hz,
+                max_hz=self._eeg_tone_l_max_hz,
+                fixed_hz=self._eeg_tone_l_fixed_hz,
+            )
+            f_r_t = _map_freq(
+                self._eeg_tone_r_freq_src,
+                min_hz=self._eeg_tone_r_min_hz,
+                max_hz=self._eeg_tone_r_max_hz,
+                fixed_hz=self._eeg_tone_r_fixed_hz,
+            )
+            v_l_t = _map_vol(
+                self._eeg_tone_l_vol_src,
+                min_vol=self._eeg_tone_l_min_vol,
+                max_vol=self._eeg_tone_l_max_vol,
+                fixed_vol=self._eeg_tone_l_fixed_vol,
+                freq_hz=float(f_l_t),
+                fmin_hz=self._eeg_tone_l_min_hz,
+                fmax_hz=self._eeg_tone_l_max_hz,
+            )
+            v_r_t = _map_vol(
+                self._eeg_tone_r_vol_src,
+                min_vol=self._eeg_tone_r_min_vol,
+                max_vol=self._eeg_tone_r_max_vol,
+                fixed_vol=self._eeg_tone_r_fixed_vol,
+                freq_hz=float(f_r_t),
+                fmin_hz=self._eeg_tone_r_min_hz,
+                fmax_hz=self._eeg_tone_r_max_hz,
+            )
+
+            self._eeg_tone_f_l = (1.0 - a) * self._eeg_tone_f_l + a * float(f_l_t)
+            self._eeg_tone_f_r = (1.0 - a) * self._eeg_tone_f_r + a * float(f_r_t)
+            self._eeg_tone_v_l = (1.0 - a) * self._eeg_tone_v_l + a * float(v_l_t)
+            self._eeg_tone_v_r = (1.0 - a) * self._eeg_tone_v_r + a * float(v_r_t)
+
+            if not self._ensure_eeg_tone_stream(channels=2):
+                return
+            self._eeg_tone_stream.set_volume_lr(float(self._eeg_tone_v_l), float(self._eeg_tone_v_r))
+            self._eeg_tone_stream.play_binaural(float(self._eeg_tone_f_l), float(self._eeg_tone_f_r))
+            return
+
         freq_src = med if self._eeg_tone_freq_src == "meditation" else att
         target_f = self._eeg_tone_min_hz + (self._eeg_tone_max_hz - self._eeg_tone_min_hz) * freq_src
 
@@ -986,11 +1273,10 @@ class MeditationMainWindow(QMainWindow):
             vol_src = med if self._eeg_tone_vol_src == "meditation" else att
             target_v = self._eeg_tone_min_vol + (self._eeg_tone_max_vol - self._eeg_tone_min_vol) * vol_src
 
-        a = self._eeg_tone_alpha
         self._eeg_tone_f_hz = (1.0 - a) * self._eeg_tone_f_hz + a * target_f
         self._eeg_tone_vol = (1.0 - a) * self._eeg_tone_vol + a * target_v
 
-        if not self._ensure_eeg_tone_stream():
+        if not self._ensure_eeg_tone_stream(channels=1):
             return
         self._eeg_tone_stream.set_volume(float(self._eeg_tone_vol))
         self._eeg_tone_stream.play_tone(float(self._eeg_tone_f_hz))

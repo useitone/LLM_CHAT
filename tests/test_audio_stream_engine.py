@@ -34,3 +34,14 @@ def test_binaural_stereo_outputs_both_channels() -> None:
     assert float(np.max(np.abs(out[:, 0]))) > 0.0
     assert float(np.max(np.abs(out[:, 1]))) > 0.0
 
+
+def test_binaural_per_channel_volume_affects_amplitude() -> None:
+    s = ToneSweepStream(StreamConfig(sample_rate=48000, channels=2))
+    out = np.zeros((2048, 2), dtype=np.float32)
+    s.play_binaural(220.0, 232.0)
+    s.set_volume_lr(0.10, 0.35)
+    s._callback(out, 2048, None, None)  # type: ignore[arg-type]
+    l = float(np.mean(np.abs(out[:, 0])))
+    r = float(np.mean(np.abs(out[:, 1])))
+    assert r > l * 2.5
+

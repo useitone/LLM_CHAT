@@ -44,6 +44,8 @@ class ToneSweepStream:
 
         self._mode: str = "idle"  # idle|tone|sweep|binaural
         self._volume = 0.15
+        self._volume_l = 0.15
+        self._volume_r = 0.15
         self._phase = 0.0
         self._phase_r = 0.0
 
@@ -98,7 +100,19 @@ class ToneSweepStream:
 
     def set_volume(self, volume: float) -> None:
         with self._lock:
-            self._volume = _clamp(float(volume), 0.0, 1.0)
+            v = _clamp(float(volume), 0.0, 1.0)
+            self._volume = v
+            self._volume_l = v
+            self._volume_r = v
+
+    def set_volume_lr(self, left: float, right: float) -> None:
+        """Set per-channel volume (0..1). If output is mono, volume is effectively averaged."""
+        with self._lock:
+            vl = _clamp(float(left), 0.0, 1.0)
+            vr = _clamp(float(right), 0.0, 1.0)
+            self._volume_l = vl
+            self._volume_r = vr
+            self._volume = (vl + vr) * 0.5
 
     def set_fades(self, fade_in_s: float, fade_out_s: float) -> None:
         with self._lock:
@@ -153,6 +167,8 @@ class ToneSweepStream:
         with self._lock:
             mode = self._mode
             vol = self._volume
+            vol_l = self._volume_l
+            vol_r = self._volume_r
             phase0 = self._phase
 
             tone_hz = self._tone_hz
@@ -203,8 +219,8 @@ class ToneSweepStream:
                 self._phase = phase_end_l % (2.0 * math.pi)
                 self._phase_r = phase_end_r % (2.0 * math.pi)
 
-            y_l *= np.float32(vol)
-            y_r *= np.float32(vol)
+            y_l *= np.float32(vol_l)
+            y_r *= np.float32(vol_r)
             outdata[:, 0] = y_l
             if outdata.shape[1] > 1:
                 outdata[:, 1] = y_r
