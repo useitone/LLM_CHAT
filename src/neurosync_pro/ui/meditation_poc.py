@@ -179,6 +179,10 @@ class MeditationMainWindow(QMainWindow):
         self._stats_timer.setInterval(1000)
         self._stats_timer.timeout.connect(self._update_stats_line)
 
+        # Vendor HR (soft headband / aabb0c — experimental).
+        self._last_hr_bpm: int | None = None
+        self._last_hr_at: float | None = None
+
         # Simple rolling metrics plot (optional, requires PySide6.QtCharts).
         self._plot_available = QChart is not None
         self._plot_enabled = False
@@ -188,6 +192,19 @@ class MeditationMainWindow(QMainWindow):
         self._att_hist = deque(maxlen=2000)
         self._med_hist = deque(maxlen=2000)
         self._plot_dirty = False
+        # Bands plot (uses QtCharts too).
+        self._bands_plot_enabled = False
+        self._bands_plot_window_s = 120.0
+        self._bands_t0 = time.monotonic()
+        self._bands_t = deque(maxlen=2000)
+        self._bands_hist: dict[str, deque] = {}
+        self._bands_plot_dirty = False
+        self._bands_chart_view = None
+        self._bands_axis_x = None
+        self._bands_axis_y = None
+        self._bands_series: dict[str, "QLineSeries"] = {}
+        self._bands_plot_last_redraw = 0.0
+        self._bands_plot_min_redraw_s = 0.25
         self._plot_last_redraw = 0.0
         self._plot_min_redraw_s = 0.15  # ~6-7 FPS max
         self._series_att = None
@@ -242,12 +259,16 @@ class MeditationMainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 2)
         splitter.setStretchFactor(2, 2)
-        self._att = QProgressBar()
-        self._att.setRange(0, 100)
-        self._att.setFormat("Attention %v")
-        self._med = QProgressBar()
-        self._med.setRange(0, 100)
-        self._med.setFormat("Meditation %v")
+        # Center metrics: keep compact numeric values (not progress bars).
+        self._hz_val = QLabel("—")
+        self._hz_val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._hr_val = QLabel("—")
+        self._hr_val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._hr_val.setToolTip("Пульс (эксп.): пакеты AA BB 0C в NUS; есть не на всех шлейфах.")
+        self._att_val = QLabel("Attention —")
+        self._att_val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._med_val = QLabel("Meditation —")
+        self._med_val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
         src_bits: list[str] = []
         if self._ble_address:
@@ -542,12 +563,22 @@ class MeditationMainWindow(QMainWindow):
         self._status = QLabel("")
         self._stats = QLabel("")
 
-        # Center-top: source + stats + metrics (keep in the middle panel).
+        # Center-top: source + stats + compact metrics.
         mid_lay.addWidget(self._src_label)
         mid_lay.addWidget(self._stats)
-        mid_lay.addWidget(QLabel("Метрики:"))
-        mid_lay.addWidget(self._att)
-        mid_lay.addWidget(self._med)
+        # Metrics header row (compact): "Метрики  Hz  <value>"
+        metrics_row = QWidget()
+        metrics_row_lay = QHBoxLayout(metrics_row)
+        metrics_row_lay.setContentsMargins(0, 0, 0, 0)
+        metrics_row_lay.addWidget(QLabel("Метрики"))
+        metrics_row_lay.addSpacing(10)
+        metrics_row_lay.addWidget(QLabel("Hz"))
+        metrics_row_lay.addWidget(self._hz_val)
+        metrics_row_lay.addSpacing(16)
+        metrics_row_lay.addWidget(QLabel("HR (exp)"))
+        metrics_row_lay.addWidget(self._hr_val)
+        metrics_row_lay.addStretch(1)
+        mid_lay.addWidget(metrics_row)
 
         # Left panel content (controls-only).
         sess_row = QWidget()
@@ -567,50 +598,53 @@ class MeditationMainWindow(QMainWindow):
         plot_row_lay = QHBoxLayout(plot_row)
         plot_row_lay.setContentsMargins(0, 0, 0, 0)
         plot_row_lay.addWidget(self._plot_cb)
+        plot_row_lay.addSpacing(10)
+        plot_row_lay.addWidget(self._att_val)
+        plot_row_lay.addSpacing(6)
+        plot_row_lay.addWidget(self._med_val)
         plot_row_lay.addStretch(1)
         plot_row_lay.addWidget(self._plot_clear_btn)
         mid_lay.addWidget(plot_row)
         if self._plot_available:
             self._init_plot_widgets(mid_lay)
 
-        # Bands: compact by default (cheap UI/CPU) with optional Full toggle.
-        self._bands_box = QGroupBox("Bands (Compact)")
+        # Bands chart: compact by default; optional Full toggle.
+        self._bands_box = QGroupBox("Bands")
         mid_lay.addWidget(self._bands_box)
-        bform = QFormLayout(self._bands_box)
+        blay = QVBoxLayout(self._bands_box)
+
+        bands_row = QWidget()
+        bands_row_lay = QHBoxLayout(bands_row)
+        bands_row_lay.setContentsMargins(0, 0, 0, 0)
+
+        self._bands_plot_cb = QCheckBox("График (Bands)")
+        self._bands_plot_cb.setEnabled(self._plot_available)
+        if not self._plot_available:
+            self._bands_plot_cb.setToolTip("PySide6.QtCharts недоступен в текущей установке.")
+        self._bands_plot_cb.toggled.connect(self._toggle_bands_plot)
+
         self._bands_full_cb = QCheckBox("Full (8 линий)")
         self._bands_full_cb.setChecked(False)
+        self._bands_full_cb.setEnabled(False)  # enabled when chart is enabled
         self._bands_full_cb.toggled.connect(self._toggle_bands_full)
+
+        self._bands_plot_clear_btn = QPushButton("Очистить график")
+        self._bands_plot_clear_btn.setEnabled(self._plot_available)
+        self._bands_plot_clear_btn.clicked.connect(self._clear_bands_plot)
+        self._bands_plot_clear_btn.setVisible(False)
+
+        bands_row_lay.addWidget(self._bands_plot_cb)
+        bands_row_lay.addWidget(self._bands_full_cb)
+        bands_row_lay.addStretch(1)
+        bands_row_lay.addWidget(self._bands_plot_clear_btn)
+        blay.addWidget(bands_row)
+
         self._bands_line = QLabel("нет данных")
         self._bands_line.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self._band_bars: dict[str, QProgressBar] = {}
-        self._band_row_label: dict[str, QLabel] = {}
+        blay.addWidget(self._bands_line)
 
-        def _mk_bar() -> QProgressBar:
-            pb = QProgressBar()
-            pb.setRange(0, 100)
-            pb.setTextVisible(False)
-            return pb
-
-        def _add_band_row(key: str, label_text: str) -> None:
-            self._band_bars[key] = _mk_bar()
-            lab = QLabel(label_text)
-            self._band_row_label[key] = lab
-            bform.addRow(lab, self._band_bars[key])
-
-        bform.addRow("", self._bands_full_cb)
-        _add_band_row("delta", "δ")
-        _add_band_row("theta", "θ")
-        _add_band_row("alpha", "α")
-        _add_band_row("beta", "β")
-        _add_band_row("gamma", "γ")
-        _add_band_row("low_alpha", "αL")
-        _add_band_row("high_alpha", "αH")
-        _add_band_row("low_beta", "βL")
-        _add_band_row("high_beta", "βH")
-        _add_band_row("low_gamma", "γL")
-        _add_band_row("high_gamma", "γH")
-        bform.addRow("Bands", self._bands_line)
-        self._apply_bands_rows_visibility()
+        if self._plot_available:
+            self._init_bands_plot_widgets(blay)
 
         self._genmon_box = QGroupBox("Generator monitor")
         mid_lay.addWidget(self._genmon_box)
@@ -888,6 +922,194 @@ class MeditationMainWindow(QMainWindow):
         self._plot_dirty = False
         self._refresh_plot()
 
+    def _toggle_bands_plot(self, on: bool) -> None:
+        if not self._plot_available:
+            return
+        self._bands_plot_enabled = bool(on)
+        if self._bands_chart_view is not None:
+            self._bands_chart_view.setVisible(self._bands_plot_enabled)
+        self._bands_plot_clear_btn.setVisible(self._bands_plot_enabled)
+        self._bands_full_cb.setEnabled(self._bands_plot_enabled)
+        if self._bands_plot_enabled:
+            self._bands_plot_timer.start()
+        else:
+            self._bands_plot_timer.stop()
+        if self._bands_plot_enabled:
+            self._refresh_bands_plot(force=True)
+
+    def _bands_plot_tick(self) -> None:
+        if not self._bands_plot_enabled or not self._bands_plot_dirty:
+            return
+        now = time.monotonic()
+        if now - self._bands_plot_last_redraw < self._bands_plot_min_redraw_s:
+            return
+        self._bands_plot_last_redraw = now
+        self._bands_plot_dirty = False
+        self._refresh_bands_plot()
+
+    def _init_bands_plot_widgets(self, lay: QVBoxLayout) -> None:
+        if not self._plot_available:
+            return
+
+        keys_compact = ("delta", "theta", "alpha", "beta", "gamma")
+        keys_full = (
+            "delta",
+            "theta",
+            "low_alpha",
+            "high_alpha",
+            "low_beta",
+            "high_beta",
+            "low_gamma",
+            "high_gamma",
+        )
+        for k in set(keys_compact) | set(keys_full):
+            self._bands_hist[k] = deque(maxlen=2000)
+
+        chart = QChart()
+        chart.legend().setVisible(True)
+        chart.setBackgroundRoundness(0)
+
+        def _mk_series(name: str) -> QLineSeries:
+            s = QLineSeries()
+            s.setName(name)
+            chart.addSeries(s)
+            return s
+
+        # Always create all series; toggle visibility by Compact/Full.
+        self._bands_series = {
+            "delta": _mk_series("δ"),
+            "theta": _mk_series("θ"),
+            "alpha": _mk_series("α"),
+            "beta": _mk_series("β"),
+            "gamma": _mk_series("γ"),
+            "low_alpha": _mk_series("αL"),
+            "high_alpha": _mk_series("αH"),
+            "low_beta": _mk_series("βL"),
+            "high_beta": _mk_series("βH"),
+            "low_gamma": _mk_series("γL"),
+            "high_gamma": _mk_series("γH"),
+        }
+
+        axis_x = QValueAxis()
+        axis_x.setTitleText("t, s")
+        axis_x.setRange(0, self._bands_plot_window_s)
+        axis_x.setLabelFormat("%.0f")
+
+        axis_y = QValueAxis()
+        axis_y.setTitleText("log10(1+x)")
+        axis_y.setRange(0.0, 6.0)
+        axis_y.setLabelFormat("%.1f")
+
+        chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
+        chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
+
+        for s in self._bands_series.values():
+            s.attachAxis(axis_x)
+            s.attachAxis(axis_y)
+
+        view = QChartView(chart)
+        view.setMinimumHeight(200)
+        view.setVisible(False)
+        lay.addWidget(view)
+
+        self._bands_axis_x = axis_x
+        self._bands_axis_y = axis_y
+        self._bands_chart_view = view
+
+        self._bands_plot_timer = QTimer(self)
+        self._bands_plot_timer.setInterval(120)
+        self._bands_plot_timer.timeout.connect(self._bands_plot_tick)
+
+        # Default: compact series visible.
+        self._apply_bands_series_visibility()
+
+    def _apply_bands_series_visibility(self) -> None:
+        compact = {"delta", "theta", "alpha", "beta", "gamma"}
+        full = {
+            "delta",
+            "theta",
+            "low_alpha",
+            "high_alpha",
+            "low_beta",
+            "high_beta",
+            "low_gamma",
+            "high_gamma",
+        }
+        show = full if self._bands_full else compact
+        for k, s in self._bands_series.items():
+            s.setVisible(k in show)
+
+    def _append_bands_plot_point(self, b: dict[str, int]) -> None:
+        if not self._plot_available:
+            return
+        t = time.monotonic() - self._bands_t0
+        self._bands_t.append(t)
+        # compact aggregates
+        alpha = int(b["low_alpha"]) + int(b["high_alpha"])
+        beta = int(b["low_beta"]) + int(b["high_beta"])
+        gamma = int(b["low_gamma"]) + int(b["high_gamma"])
+        vals = {
+            "delta": int(b["delta"]),
+            "theta": int(b["theta"]),
+            "alpha": int(alpha),
+            "beta": int(beta),
+            "gamma": int(gamma),
+            "low_alpha": int(b["low_alpha"]),
+            "high_alpha": int(b["high_alpha"]),
+            "low_beta": int(b["low_beta"]),
+            "high_beta": int(b["high_beta"]),
+            "low_gamma": int(b["low_gamma"]),
+            "high_gamma": int(b["high_gamma"]),
+        }
+        for k, v in vals.items():
+            if k in self._bands_hist:
+                self._bands_hist[k].append(int(v))
+        self._bands_plot_dirty = True
+
+    def _clear_bands_plot(self) -> None:
+        if not self._plot_available:
+            return
+        self._bands_t0 = time.monotonic()
+        self._bands_t.clear()
+        for dq in self._bands_hist.values():
+            dq.clear()
+        self._bands_plot_dirty = True
+        for s in self._bands_series.values():
+            s.clear()
+        if self._bands_axis_x is not None:
+            self._bands_axis_x.setRange(0, self._bands_plot_window_s)
+
+    def _refresh_bands_plot(self, *, force: bool = False) -> None:
+        if not self._plot_available or not self._bands_plot_enabled:
+            return
+        if self._bands_axis_x is None or not self._bands_series:
+            return
+        n = len(self._bands_t)
+        if n < 2 and not force:
+            return
+
+        t_end = self._bands_t[-1] if n else 0.0
+        t_start = max(0.0, t_end - self._bands_plot_window_s)
+        self._bands_axis_x.setRange(t_start, max(t_start + 1.0, t_end))
+
+        def _log1p(x: int) -> float:
+            return math.log10(1.0 + max(0, int(x)))
+
+        # Build visible window points.
+        idxs = [i for i, t in enumerate(self._bands_t) if t >= t_start]
+        if len(idxs) > 600:
+            step = int(math.ceil(len(idxs) / 600))
+            idxs = idxs[::step]
+
+        for key, series in self._bands_series.items():
+            if not series.isVisible():
+                continue
+            h = self._bands_hist.get(key)
+            if not h:
+                continue
+            pts = [(self._bands_t[i], _log1p(h[i])) for i in idxs if i < len(h)]
+            series.replace([QPointF(x, y) for x, y in pts])
+
     def _init_plot_widgets(self, lay: QVBoxLayout) -> None:
         if not self._plot_available:
             return
@@ -1005,6 +1227,27 @@ class MeditationMainWindow(QMainWindow):
         fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
         fp.flush()
 
+    def _append_hr_session_log(self, bpm: int) -> None:
+        if not self._session_log_active:
+            return
+        fp = self._session_log_file
+        if fp is None and self._session_log_path is not None:
+            self._session_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._session_log_file = self._session_log_path.open("a", encoding="utf-8")
+            fp = self._session_log_file
+        if fp is None and self._session_log_path is None:
+            self._new_session_log()
+            fp = self._session_log_file
+            if fp is None:
+                return
+        rec = {
+            "type": "hr",
+            "timestamp_utc": datetime.now(UTC).isoformat(),
+            "hr": {"bpm": int(bpm), "source": "aabb0c_exp"},
+        }
+        fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        fp.flush()
+
     def _start_ble(self) -> None:
         if not self._ble_address or self._ble_thread is not None:
             return
@@ -1013,6 +1256,9 @@ class MeditationMainWindow(QMainWindow):
         self._ble_stop.setEnabled(True)
         self._session_started_at = time.monotonic()
         self._last_metric_at = None
+        self._last_hr_bpm = None
+        self._last_hr_at = None
+        self._hr_val.setText("—")
         self._metric_times.clear()
         th = BleNotifyThread(
             self._ble_address,
@@ -1023,6 +1269,7 @@ class MeditationMainWindow(QMainWindow):
         th.metricsReady.connect(self._on_ble_metrics)
         th.signalQualityReady.connect(self._on_ble_signal_quality)
         th.bandsReady.connect(self._on_ble_bands)
+        th.heartRateReady.connect(self._on_ble_heart_rate)
         th.connectionFailed.connect(self._on_ble_failed)
         th.workerFinished.connect(self._on_ble_worker_finished)
         self._ble_thread = th
@@ -1046,8 +1293,8 @@ class MeditationMainWindow(QMainWindow):
             self._prev_metrics = cur
         self._last_att = att
         self._last_med = med
-        self._att.setValue(att)
-        self._med.setValue(med)
+        self._att_val.setText(f"Attention {int(att)}")
+        self._med_val.setText(f"Meditation {int(med)}")
         self._bus.publish("eeg.metrics", {"attention": att, "meditation": med})
         self._append_session_log(att, med)
         self._append_plot_point(att, med)
@@ -1055,6 +1302,12 @@ class MeditationMainWindow(QMainWindow):
         self._apply_eeg_binaural()
         if self._status.text().startswith("BLE: подключение"):
             self._status.setText("BLE: поток активен")
+
+    def _on_ble_heart_rate(self, bpm: int) -> None:
+        self._last_hr_bpm = int(bpm)
+        self._last_hr_at = time.monotonic()
+        self._bus.publish("vendor.heart_rate", {"bpm": int(bpm), "source": "aabb0c_exp"})
+        self._append_hr_session_log(int(bpm))
 
     def _on_ble_signal_quality(self, q: int) -> None:
         try:
@@ -1095,6 +1348,8 @@ class MeditationMainWindow(QMainWindow):
             self._bands_change_times.append(time.monotonic())
             self._prev_bands_compact = cur_c
         self._refresh_bands_ui()
+        if self._bands_plot_enabled and self._plot_available:
+            self._append_bands_plot_point(self._last_bands)
 
     def _on_ble_failed(self, msg: str) -> None:
         self._status.setText(f"BLE ошибка: {msg}")
@@ -1135,8 +1390,8 @@ class MeditationMainWindow(QMainWindow):
         self._metric_times.append(now)
         self._last_att = att
         self._last_med = med
-        self._att.setValue(att)
-        self._med.setValue(med)
+        self._att_val.setText(f"Attention {int(att)}")
+        self._med_val.setText(f"Meditation {int(med)}")
         self._bus.publish("eeg.metrics", {"attention": att, "meditation": med})
         self._append_session_log(att, med)
         self._append_plot_point(att, med)
@@ -1186,6 +1441,16 @@ class MeditationMainWindow(QMainWindow):
                 n += 1
             hz = n / 10.0
             parts.append(f"{hz:.1f} Hz")
+        self._hz_val.setText(f"{hz:.1f}" if hz is not None else "—")
+
+        if self._last_hr_bpm is not None and self._last_hr_at is not None:
+            age_hr = now - self._last_hr_at
+            if age_hr > 30.0:
+                self._hr_val.setText(f"{self._last_hr_bpm} (нет обновл.)")
+            else:
+                self._hr_val.setText(str(self._last_hr_bpm))
+        else:
+            self._hr_val.setText("—")
 
         # Change rates over last 10 seconds (how often values change).
         if self._metrics_change_times:
@@ -1220,29 +1485,9 @@ class MeditationMainWindow(QMainWindow):
 
     def _toggle_bands_full(self, on: bool) -> None:
         self._bands_full = bool(on)
-        self._bands_box.setTitle("Bands (Full)" if self._bands_full else "Bands (Compact)")
-        self._apply_bands_rows_visibility()
+        self._apply_bands_series_visibility()
         self._refresh_bands_ui(force=True)
-
-    def _apply_bands_rows_visibility(self) -> None:
-        compact_keys = {"delta", "theta", "alpha", "beta", "gamma"}
-        full_keys = {
-            "delta",
-            "theta",
-            "low_alpha",
-            "high_alpha",
-            "low_beta",
-            "high_beta",
-            "low_gamma",
-            "high_gamma",
-        }
-        show = full_keys if self._bands_full else compact_keys
-        for key, pb in self._band_bars.items():
-            vis = key in show
-            pb.setVisible(vis)
-            lab = self._band_row_label.get(key)
-            if lab is not None:
-                lab.setVisible(vis)
+        self._refresh_bands_plot(force=True)
 
     def _refresh_bands_ui(self, *, force: bool = False) -> None:
         now = time.monotonic()
@@ -1253,26 +1498,7 @@ class MeditationMainWindow(QMainWindow):
         b = self._last_bands
         if not b:
             self._bands_line.setText("нет данных")
-            for pb in self._band_bars.values():
-                pb.setValue(0)
             return
-
-        def _log1p(x: int) -> float:
-            return math.log10(1.0 + max(0, int(x)))
-
-        def _norm(name: str, x: int) -> int:
-            # Dynamic range with slow max decay for readable bars.
-            v = _log1p(x)
-            m = float(self._bands_max_log.get(name, 1.0))
-            if v > m:
-                m = v
-            else:
-                # decay ~2% per refresh
-                m = max(0.5, m * 0.98)
-                if v > m:
-                    m = v
-            self._bands_max_log[name] = m
-            return int(100.0 * (v / m)) if m > 1e-9 else 0
 
         if self._bands_full:
             self._bands_line.setText(
@@ -1280,14 +1506,6 @@ class MeditationMainWindow(QMainWindow):
                     **b
                 )
             )
-            self._band_bars["delta"].setValue(_norm("delta", int(b["delta"])))
-            self._band_bars["theta"].setValue(_norm("theta", int(b["theta"])))
-            self._band_bars["low_alpha"].setValue(_norm("low_alpha", int(b["low_alpha"])))
-            self._band_bars["high_alpha"].setValue(_norm("high_alpha", int(b["high_alpha"])))
-            self._band_bars["low_beta"].setValue(_norm("low_beta", int(b["low_beta"])))
-            self._band_bars["high_beta"].setValue(_norm("high_beta", int(b["high_beta"])))
-            self._band_bars["low_gamma"].setValue(_norm("low_gamma", int(b["low_gamma"])))
-            self._band_bars["high_gamma"].setValue(_norm("high_gamma", int(b["high_gamma"])))
             return
 
         alpha = int(b["low_alpha"]) + int(b["high_alpha"])
@@ -1296,12 +1514,6 @@ class MeditationMainWindow(QMainWindow):
         self._bands_line.setText(
             f"δ={b['delta']}  θ={b['theta']}  α={alpha}  β={beta}  γ={gamma}"
         )
-
-        self._band_bars["delta"].setValue(_norm("delta", int(b["delta"])))
-        self._band_bars["theta"].setValue(_norm("theta", int(b["theta"])))
-        self._band_bars["alpha"].setValue(_norm("alpha", alpha))
-        self._band_bars["beta"].setValue(_norm("beta", beta))
-        self._band_bars["gamma"].setValue(_norm("gamma", gamma))
 
     def _tick_rssi_scan(self) -> None:
         # Best-effort RSSI refresh via a short advertisement scan.

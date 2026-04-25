@@ -8,6 +8,7 @@ from PySide6.QtCore import QThread, Signal
 
 from neurosync_pro.eeg.ble_stream import run_ble_notify_session, schedule_stop
 from neurosync_pro.eeg.live_decode import LiveEegDecoder
+from neurosync_pro.eeg.vendor_stream import Aabb0cHeartRateParser
 
 
 class BleNotifyThread(QThread):
@@ -16,6 +17,7 @@ class BleNotifyThread(QThread):
     metricsReady = Signal(int, int)
     signalQualityReady = Signal(int)
     bandsReady = Signal(int, int, int, int, int, int, int, int, int, int)
+    heartRateReady = Signal(int)  # vendor HR (aabb0c, experimental)
     connectionFailed = Signal(str)
     workerFinished = Signal()
 
@@ -45,6 +47,7 @@ class BleNotifyThread(QThread):
         asyncio.set_event_loop(self._loop)
         self._stop_ev = asyncio.Event()
         decoder = LiveEegDecoder()
+        hr_scan = Aabb0cHeartRateParser()
 
         def on_chunk(data: bytes) -> None:
             for frame in decoder.feed_chunk(data):
@@ -63,6 +66,8 @@ class BleNotifyThread(QThread):
                     int(frame.attention),
                     int(frame.meditation),
                 )
+            for bpm in hr_scan.feed(data):
+                self.heartRateReady.emit(int(bpm))
 
         try:
             self._loop.run_until_complete(
