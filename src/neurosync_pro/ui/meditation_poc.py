@@ -212,6 +212,20 @@ class MeditationMainWindow(QMainWindow):
         self._axis_x = None
         self._axis_y = None
         self._chart_view = None
+        # HR (vendor) line chart
+        self._hr_plot_enabled = False
+        self._hr_plot_window_s = 120.0
+        self._hr_t0 = time.monotonic()
+        self._hr_t = deque(maxlen=2000)
+        self._hr_bpm_hist = deque(maxlen=2000)
+        self._hr_plot_dirty = False
+        self._hr_plot_last_redraw = 0.0
+        self._hr_plot_min_redraw_s = 0.2
+        self._series_hr = None
+        self._hr_axis_x = None
+        self._hr_axis_y = None
+        self._hr_chart_view = None
+        self._hr_plot_timer: QTimer | None = None
 
         self._eeg_it: Iterator[tuple[int, int]] | None = None
         if self._ble_address is None and jsonl_path and jsonl_path.is_file():
@@ -607,6 +621,25 @@ class MeditationMainWindow(QMainWindow):
         mid_lay.addWidget(plot_row)
         if self._plot_available:
             self._init_plot_widgets(mid_lay)
+
+        hr_plot_row = QWidget()
+        hr_plot_row_lay = QHBoxLayout(hr_plot_row)
+        hr_plot_row_lay.setContentsMargins(0, 0, 0, 0)
+        self._hr_plot_cb = QCheckBox("График (HR, exp)")
+        self._hr_plot_cb.setEnabled(self._plot_available)
+        if not self._plot_available:
+            self._hr_plot_cb.setToolTip("PySide6.QtCharts недоступен в текущей установке.")
+        self._hr_plot_cb.toggled.connect(self._toggle_hr_plot)
+        self._hr_plot_clear_btn = QPushButton("Очистить график HR")
+        self._hr_plot_clear_btn.setEnabled(self._plot_available)
+        self._hr_plot_clear_btn.clicked.connect(self._clear_hr_plot)
+        self._hr_plot_clear_btn.setVisible(False)
+        hr_plot_row_lay.addWidget(self._hr_plot_cb)
+        hr_plot_row_lay.addStretch(1)
+        hr_plot_row_lay.addWidget(self._hr_plot_clear_btn)
+        mid_lay.addWidget(hr_plot_row)
+        if self._plot_available:
+            self._init_hr_plot_widgets(mid_lay)
 
         # Bands chart: compact by default; optional Full toggle.
         self._bands_box = QGroupBox("Bands")
@@ -1205,6 +1238,119 @@ class MeditationMainWindow(QMainWindow):
         self._series_att.replace([QPointF(x, y) for x, y in pts_att])
         self._series_med.replace([QPointF(x, y) for x, y in pts_med])
 
+    def _toggle_hr_plot(self, on: bool) -> None:
+        if not self._plot_available:
+            return
+        self._hr_plot_enabled = bool(on)
+        if self._hr_chart_view is not None:
+            self._hr_chart_view.setVisible(self._hr_plot_enabled)
+        self._hr_plot_clear_btn.setVisible(self._hr_plot_enabled)
+        if self._hr_plot_enabled:
+            self._hr_plot_timer.start()
+        else:
+            self._hr_plot_timer.stop()
+        if self._hr_plot_enabled:
+            self._refresh_hr_plot(force=True)
+
+    def _hr_plot_tick(self) -> None:
+        if not self._hr_plot_enabled or not self._hr_plot_dirty:
+            return
+        now = time.monotonic()
+        if now - self._hr_plot_last_redraw < self._hr_plot_min_redraw_s:
+            return
+        self._hr_plot_last_redraw = now
+        self._hr_plot_dirty = False
+        self._refresh_hr_plot()
+
+    def _init_hr_plot_widgets(self, lay: QVBoxLayout) -> None:
+        if not self._plot_available:
+            return
+        series_hr = QLineSeries()
+        series_hr.setName("HR (BPM, exp)")
+        chart = QChart()
+        chart.addSeries(series_hr)
+        chart.legend().setVisible(True)
+        chart.setBackgroundRoundness(0)
+
+        axis_x = QValueAxis()
+        axis_x.setTitleText("t, s")
+        axis_x.setRange(0, self._hr_plot_window_s)
+        axis_x.setLabelFormat("%.0f")
+        axis_y = QValueAxis()
+        axis_y.setRange(40, 200)
+        axis_y.setTitleText("BPM")
+        axis_y.setLabelFormat("%.0f")
+
+        chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
+        chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
+        series_hr.attachAxis(axis_x)
+        series_hr.attachAxis(axis_y)
+
+        view = QChartView(chart)
+        view.setMinimumHeight(160)
+        view.setVisible(False)
+        lay.addWidget(view)
+
+        self._series_hr = series_hr
+        self._hr_axis_x = axis_x
+        self._hr_axis_y = axis_y
+        self._hr_chart_view = view
+
+        self._hr_plot_timer = QTimer(self)
+        self._hr_plot_timer.setInterval(120)
+        self._hr_plot_timer.timeout.connect(self._hr_plot_tick)
+
+    def _append_hr_plot_point(self, bpm: int) -> None:
+        if not self._plot_available:
+            return
+        t = time.monotonic() - self._hr_t0
+        self._hr_t.append(t)
+        self._hr_bpm_hist.append(int(bpm))
+        self._hr_plot_dirty = True
+
+    def _clear_hr_plot(self) -> None:
+        if not self._plot_available:
+            return
+        self._hr_t0 = time.monotonic()
+        self._hr_t.clear()
+        self._hr_bpm_hist.clear()
+        self._hr_plot_dirty = True
+        if self._series_hr is not None:
+            self._series_hr.clear()
+        if self._hr_axis_x is not None:
+            self._hr_axis_x.setRange(0, self._hr_plot_window_s)
+        if self._hr_axis_y is not None:
+            self._hr_axis_y.setRange(40, 200)
+
+    def _refresh_hr_plot(self, *, force: bool = False) -> None:
+        if not self._plot_available or not self._hr_plot_enabled:
+            return
+        if self._series_hr is None or self._hr_axis_x is None:
+            return
+        n = len(self._hr_t)
+        if n < 1 and not force:
+            return
+        t_end = self._hr_t[-1] if n else 0.0
+        t_start = max(0.0, t_end - self._hr_plot_window_s)
+        self._hr_axis_x.setRange(t_start, max(t_start + 1.0, t_end))
+        pts = []
+        for t, b in zip(self._hr_t, self._hr_bpm_hist):
+            if t < t_start:
+                continue
+            pts.append((t, float(b)))
+        if len(pts) > 600:
+            step = int(math.ceil(len(pts) / 600))
+            pts = pts[::step]
+        if pts and self._hr_axis_y is not None:
+            ys = [p[1] for p in pts]
+            lo = max(30.0, min(ys) - 5.0)
+            hi = min(240.0, max(ys) + 5.0)
+            if hi - lo < 10.0:
+                mid = (lo + hi) * 0.5
+                lo, hi = mid - 10.0, mid + 10.0
+            self._hr_axis_y.setRange(lo, hi)
+        self._series_hr.replace([QPointF(x, y) for x, y in pts])
+
     def _append_session_log(self, att: int, med: int) -> None:
         if not self._session_log_active:
             return
@@ -1259,6 +1405,8 @@ class MeditationMainWindow(QMainWindow):
         self._last_hr_bpm = None
         self._last_hr_at = None
         self._hr_val.setText("—")
+        if self._plot_available:
+            self._clear_hr_plot()
         self._metric_times.clear()
         th = BleNotifyThread(
             self._ble_address,
@@ -1306,6 +1454,7 @@ class MeditationMainWindow(QMainWindow):
     def _on_ble_heart_rate(self, bpm: int) -> None:
         self._last_hr_bpm = int(bpm)
         self._last_hr_at = time.monotonic()
+        self._append_hr_plot_point(int(bpm))
         self._bus.publish("vendor.heart_rate", {"bpm": int(bpm), "source": "aabb0c_exp"})
         self._append_hr_session_log(int(bpm))
 
@@ -1400,6 +1549,8 @@ class MeditationMainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self._stats_timer.stop()
+        if self._hr_plot_timer is not None:
+            self._hr_plot_timer.stop()
         self._stop_eeg_tone()
         self._stop_eeg_binaural()
         if self._ble_scan_thread is not None and self._ble_scan_thread.isRunning():
