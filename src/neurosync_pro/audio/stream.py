@@ -69,6 +69,10 @@ class ToneSweepStream:
         self._noise_start_t: float | None = None
         self._noise_stop_t: float | None = None
         self._noise_rng = np.random.default_rng()
+        self._noise_color: str = "white"  # white|pink|brown
+        # filter state (per channel) for colored noise
+        self._pink_state = None
+        self._brown_state = None
 
         self._stream = None
 
@@ -165,15 +169,62 @@ class ToneSweepStream:
             self._mode = "idle"
             self._sweep_start_t = None
 
-    def play_noise(self, *, seed: int | None = None) -> None:
-        """Play white noise continuously (mono or stereo depending on stream channels)."""
+    def play_noise(self, *, seed: int | None = None, color: str = "white") -> None:
+        """Play noise continuously (mono or stereo depending on stream channels).
+
+        color: white|pink|brown
+        """
         with self._lock:
             if seed is not None:
                 self._noise_rng = np.random.default_rng(int(seed))
+            c = str(color or "white").lower().strip()
+            if c not in ("white", "pink", "brown"):
+                c = "white"
+            self._noise_color = c
             self._mode = "noise"
             self._sweep_start_t = None
             self._noise_start_t = time.monotonic()
             self._noise_stop_t = None
+            # reset filter states on restart
+            self._pink_state = None
+            self._brown_state = None
+
+    @staticmethod
+    def _pink_filter(x: np.ndarray, state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        # Paul Kellet's refined pink noise filter (approx 1/f).
+        # state: shape (7,)
+        b0, b1, b2, b3, b4, b5, b6 = [float(v) for v in state.tolist()]
+        y = np.empty_like(x, dtype=np.float32)
+        for i in range(x.shape[0]):
+            w = float(x[i])
+            b0 = 0.99886 * b0 + w * 0.0555179
+            b1 = 0.99332 * b1 + w * 0.0750759
+            b2 = 0.96900 * b2 + w * 0.1538520
+            b3 = 0.86650 * b3 + w * 0.3104856
+            b4 = 0.55000 * b4 + w * 0.5329522
+            b5 = -0.7616 * b5 - w * 0.0168980
+            out = b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362
+            b6 = w * 0.115926
+            y[i] = np.float32(out)
+        st = np.array([b0, b1, b2, b3, b4, b5, b6], dtype=np.float32)
+        return y, st
+
+    @staticmethod
+    def _brown_filter(x: np.ndarray, state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        # Brown(ian) noise via leaky integrator.
+        # state: shape (1,)
+        s = float(state[0])
+        y = np.empty_like(x, dtype=np.float32)
+        leak = 0.999  # prevents drift
+        for i in range(x.shape[0]):
+            s = leak * s + float(x[i]) * 0.02
+            # clamp to avoid runaway
+            if s > 1.0:
+                s = 1.0
+            elif s < -1.0:
+                s = -1.0
+            y[i] = np.float32(s)
+        return y, np.array([s], dtype=np.float32)
 
     def _callback(self, outdata: np.ndarray, frames: int, _time_info, status) -> None:  # noqa: ANN001
         if status:
@@ -248,11 +299,12 @@ class ToneSweepStream:
             return
 
         if mode == "noise":
-            # White noise. Use fade-in/out envelope to avoid clicks.
+            # Noise (white/pink/brown). Use fade-in/out envelope to avoid clicks.
             with self._lock:
                 rng = self._noise_rng
                 ns = self._noise_start_t
                 ne = self._noise_stop_t
+                color = self._noise_color
             now = time.monotonic()
 
             env = 1.0
@@ -265,16 +317,37 @@ class ToneSweepStream:
                     outdata[:] = 0.0
                     return
 
-            if outdata.shape[1] > 1:
-                y = rng.standard_normal((frames, outdata.shape[1]), dtype=np.float32)
+            ch = int(outdata.shape[1])
+            if ch > 1:
+                y = rng.standard_normal((frames, ch), dtype=np.float32)
+                if color != "white":
+                    # per-channel colored filtering
+                    if color == "pink":
+                        if self._pink_state is None or int(getattr(self._pink_state, "shape", [0])[0]) != (7 * ch):
+                            self._pink_state = np.zeros((ch, 7), dtype=np.float32)
+                        for c in range(ch):
+                            y[:, c], self._pink_state[c] = self._pink_filter(y[:, c], self._pink_state[c])
+                    elif color == "brown":
+                        if self._brown_state is None or int(getattr(self._brown_state, "shape", [0])[0]) != ch:
+                            self._brown_state = np.zeros((ch, 1), dtype=np.float32)
+                        for c in range(ch):
+                            y[:, c], self._brown_state[c] = self._brown_filter(y[:, c], self._brown_state[c])
                 y[:, 0] *= np.float32(vol_l)
                 y[:, 1] *= np.float32(vol_r)
-                if outdata.shape[1] > 2:
+                if ch > 2:
                     y[:, 2:] *= np.float32(vol)
                 outdata[:] = y * np.float32(env)
             else:
-                y = rng.standard_normal(frames, dtype=np.float32) * np.float32(vol)
-                outdata[:, 0] = y * np.float32(env)
+                y = rng.standard_normal(frames, dtype=np.float32)
+                if color == "pink":
+                    if self._pink_state is None:
+                        self._pink_state = np.zeros((1, 7), dtype=np.float32)
+                    y, self._pink_state[0] = self._pink_filter(y, self._pink_state[0])
+                elif color == "brown":
+                    if self._brown_state is None:
+                        self._brown_state = np.zeros((1, 1), dtype=np.float32)
+                    y, self._brown_state[0] = self._brown_filter(y, self._brown_state[0])
+                outdata[:, 0] = (y * np.float32(vol)) * np.float32(env)
             return
 
         # Sweep mode.

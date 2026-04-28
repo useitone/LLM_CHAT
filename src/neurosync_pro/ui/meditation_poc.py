@@ -9,7 +9,10 @@ import json
 import random
 import sys
 import tempfile
+import threading
 import time
+import urllib.request
+import uuid
 from collections import deque
 from datetime import UTC, datetime
 from io import TextIOBase
@@ -27,11 +30,14 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QProgressBar,
     QPushButton,
+    QPlainTextEdit,
     QScrollArea,
     QSplitter,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -94,6 +100,8 @@ class MeditationMainWindow(QMainWindow):
         self._session_log_path = session_log_path
         self._session_log_file: TextIOBase | None = None
         self._session_log_active = session_log_path is not None
+        self._session_id = str(uuid.uuid4())
+        self._session_t0_mono: float | None = None
         self._last_att = 0
         self._last_med = 0
         self._ble_selected_rssi: int | None = None
@@ -164,6 +172,37 @@ class MeditationMainWindow(QMainWindow):
         self._eeg_bin_delta_hz = 8.0
         self._eeg_bin_last_delta_at = 0.0
 
+        # Manual white noise (separate stream, can run alongside EEG→Tone).
+        self._noise_available = ToneSweepStream is not None
+        self._noise_enabled = False
+        self._noise_stream = None
+        self._noise_vol = 0.08
+        self._noise_color = "white"  # white|pink|brown
+        self._noise_fade_in_s = 0.02
+        self._noise_fade_out_s = 0.08
+        self._noise_stop_gen = 0
+
+        # Cache the base text for the tone monitor line.
+        # We must not build strings cumulatively from QLabel.text(), otherwise it grows unbounded.
+        self._tone_base_text = "—"
+
+        # Programmer (agent-driven) — minimal spec executor (binaural + noise).
+        self._prog_available = ToneSweepStream is not None
+        self._prog_running = False
+        self._prog_spec = "100+7/0.60 pink/0.08"
+        self._prog_tone_stream = None
+        self._prog_noise_stream = None
+        self._prog_timers: list[QTimer] = []
+        self._prog_timeline_running = False
+        self._prog_noise_color = "pink"
+        self._prog_noise_vol = 0.08
+        self._prog_tone_left_hz = 96.5
+        self._prog_tone_right_hz = 103.5
+        self._prog_tone_vol = 0.60
+        self._prog_last_status_at = 0.0
+        self._prog_status_min_s = 0.25
+        self._prog_sink_url = ""
+
         # Generator monitor (UI-only; mirrors what we send to audio engine).
         self._genmon_text = ""
 
@@ -178,6 +217,13 @@ class MeditationMainWindow(QMainWindow):
         self._stats_timer = QTimer(self)
         self._stats_timer.setInterval(1000)
         self._stats_timer.timeout.connect(self._update_stats_line)
+
+        # Observation logger (windowed aggregates for diary/training).
+        self._obs_window_s = 10.0
+        self._obs_timer = QTimer(self)
+        self._obs_timer.setInterval(int(self._obs_window_s * 1000))
+        self._obs_timer.timeout.connect(self._emit_observation)
+        self._obs_points: deque[dict[str, Any]] = deque(maxlen=5000)
 
         # Vendor HR (soft headband / aabb0c — experimental).
         self._last_hr_bpm: int | None = None
@@ -227,6 +273,33 @@ class MeditationMainWindow(QMainWindow):
         self._hr_chart_view = None
         self._hr_plot_timer: QTimer | None = None
 
+        # EEG→Tone graph: mono (f, v) and stereo (fL, fR, vL, vR); dual Y: Hz, vol.
+        self._tone_plot_enabled = False
+        self._tone_plot_window_s = 120.0
+        self._tone_t0 = time.monotonic()
+        self._tone_m_t: deque = deque(maxlen=2000)
+        self._tone_m_f: deque = deque(maxlen=2000)
+        self._tone_m_v: deque = deque(maxlen=2000)
+        self._tone_s_t: deque = deque(maxlen=2000)
+        self._tone_s_f_l: deque = deque(maxlen=2000)
+        self._tone_s_f_r: deque = deque(maxlen=2000)
+        self._tone_s_v_l: deque = deque(maxlen=2000)
+        self._tone_s_v_r: deque = deque(maxlen=2000)
+        self._tone_plot_dirty = False
+        self._tone_plot_last_redraw = 0.0
+        self._tone_plot_min_redraw_s = 0.2
+        self._series_tone_f = None
+        self._series_tone_v = None
+        self._series_tone_f_l = None
+        self._series_tone_f_r = None
+        self._series_tone_v_l = None
+        self._series_tone_v_r = None
+        self._tone_axis_x = None
+        self._tone_axis_y_hz = None
+        self._tone_axis_y_vol = None
+        self._tone_chart_view = None
+        self._tone_plot_timer: QTimer | None = None
+
         self._eeg_it: Iterator[tuple[int, int]] | None = None
         if self._ble_address is None and jsonl_path and jsonl_path.is_file():
             self._eeg_it = iter(_iter_eeg(jsonl_path))
@@ -235,6 +308,7 @@ class MeditationMainWindow(QMainWindow):
             session_log_path.parent.mkdir(parents=True, exist_ok=True)
             # CLI-provided log path: keep append semantics (explicit user choice).
             self._session_log_file = session_log_path.open("a", encoding="utf-8")
+            self._write_session_start()
 
         cw = QWidget()
         root = QHBoxLayout(cw)
@@ -264,7 +338,105 @@ class MeditationMainWindow(QMainWindow):
         right_lay = QVBoxLayout(right_widget)
         right_lay.setContentsMargins(8, 8, 8, 8)
         right_lay.setSpacing(6)
-        right_lay.addWidget(QLabel("Программатор (скоро)"))
+        self._prog_box = QGroupBox("Программатор")
+        pb = QVBoxLayout(self._prog_box)
+        pb.setContentsMargins(8, 8, 8, 8)
+        pb.setSpacing(6)
+
+        self._prog_tabs = QTabWidget()
+        self._prog_tabs.setEnabled(self._prog_available)
+
+        spec_tab = QWidget()
+        spec_lay = QVBoxLayout(spec_tab)
+        spec_lay.setContentsMargins(0, 0, 0, 0)
+        self._prog_spec_edit = QLineEdit()
+        self._prog_spec_edit.setPlaceholderText("spec, напр: 100+7/0.60 pink/0.08  или  sweep:1000->100/30/0.6")
+        self._prog_spec_edit.setText(self._prog_spec)
+        self._prog_spec_edit.setEnabled(self._prog_available)
+        spec_lay.addWidget(self._prog_spec_edit)
+        self._prog_tabs.addTab(spec_tab, "Spec")
+
+        tl_tab = QWidget()
+        tl_lay = QVBoxLayout(tl_tab)
+        tl_lay.setContentsMargins(0, 0, 0, 0)
+        self._prog_tl_edit = QPlainTextEdit()
+        self._prog_tl_edit.setPlaceholderText("Timeline (mm:ss spec), напр:\n0:00 sweep:1000->100/30/0.6 pink/0.08\n0:25 100+7/0.6 pink/0.08\n0:30 off")
+        self._prog_tl_edit.setPlainText(
+            "0:00 sweep:1000->100/30/0.6 pink/0.08\n0:25 100+7/0.60 pink/0.08\n0:30 off\n"
+        )
+        tl_lay.addWidget(self._prog_tl_edit)
+        self._prog_tabs.addTab(tl_tab, "Timeline")
+
+        pb.addWidget(self._prog_tabs)
+
+        prog_btn_row = QWidget()
+        prog_btn_lay = QHBoxLayout(prog_btn_row)
+        prog_btn_lay.setContentsMargins(0, 0, 0, 0)
+        self._prog_run_btn = QPushButton("Run")
+        self._prog_stop_btn = QPushButton("Stop")
+        self._prog_run_btn.setEnabled(self._prog_available)
+        self._prog_stop_btn.setEnabled(False)
+        self._prog_run_btn.clicked.connect(self._prog_run_clicked)
+        self._prog_stop_btn.clicked.connect(self._prog_stop_clicked)
+        prog_btn_lay.addWidget(self._prog_run_btn)
+        prog_btn_lay.addWidget(self._prog_stop_btn)
+        prog_btn_lay.addStretch(1)
+        pb.addWidget(prog_btn_row)
+
+        def _tab_changed(_i: int) -> None:
+            # Keep button text consistent with current state.
+            if not hasattr(self, "_prog_run_btn"):
+                return
+            if self._prog_running and hasattr(self, "_prog_tabs") and int(self._prog_tabs.currentIndex()) == 0:
+                self._prog_run_btn.setText("Apply")
+            else:
+                self._prog_run_btn.setText("Run")
+
+        self._prog_tabs.currentChanged.connect(_tab_changed)
+
+        self._prog_status_lbl = QLabel("idle")
+        self._prog_status_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        pb.addWidget(self._prog_status_lbl)
+
+        marker_row = QWidget()
+        marker_lay = QHBoxLayout(marker_row)
+        marker_lay.setContentsMargins(0, 0, 0, 0)
+        marker_lay.addWidget(QLabel("Marker"))
+        self._marker_edit = QLineEdit()
+        self._marker_edit.setPlaceholderText("например: focus↑ / distracted / artifact_motion")
+        marker_lay.addWidget(self._marker_edit, 1)
+        marker_lay.addWidget(QLabel("R"))
+        self._marker_rating = QDoubleSpinBox()
+        self._marker_rating.setRange(-2.0, 2.0)
+        self._marker_rating.setSingleStep(1.0)
+        self._marker_rating.setDecimals(0)
+        self._marker_rating.setValue(0.0)
+        self._marker_rating.setToolTip("Быстрая оценка: -2..+2")
+        self._marker_rating.setFixedWidth(60)
+        marker_lay.addWidget(self._marker_rating)
+        self._marker_note = QLineEdit()
+        self._marker_note.setPlaceholderText("note (опц.)")
+        marker_lay.addWidget(self._marker_note, 1)
+        self._marker_btn = QPushButton("Add")
+        self._marker_btn.clicked.connect(self._add_marker_clicked)
+        marker_lay.addWidget(self._marker_btn)
+        pb.addWidget(marker_row)
+
+        sink_row = QWidget()
+        sink_lay = QHBoxLayout(sink_row)
+        sink_lay.setContentsMargins(0, 0, 0, 0)
+        sink_lay.addWidget(QLabel("Sink URL"))
+        self._prog_sink_edit = QLineEdit()
+        self._prog_sink_edit.setPlaceholderText("http://127.0.0.1:8766/v1/ui_event (опц.)")
+        self._prog_sink_edit.setText(self._prog_sink_url)
+        self._prog_sink_edit.setEnabled(True)
+        self._prog_sink_edit.textChanged.connect(self._prog_sink_changed)
+        sink_lay.addWidget(self._prog_sink_edit, 1)
+        pb.addWidget(sink_row)
+
+        if not self._prog_available:
+            self._prog_box.setToolTip("Установите audio extras: pip install -e \".[audio]\"")
+        right_lay.addWidget(self._prog_box)
         right_lay.addStretch(1)
 
         splitter.addWidget(left_scroll)
@@ -273,12 +445,13 @@ class MeditationMainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 2)
         splitter.setStretchFactor(2, 2)
-        # Center metrics: keep compact numeric values (not progress bars).
-        self._hz_val = QLabel("—")
-        self._hz_val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        # Center metrics: HR value sits next to its graph; EEG Hz only in the stats line above.
         self._hr_val = QLabel("—")
         self._hr_val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self._hr_val.setToolTip("Пульс (эксп.): пакеты AA BB 0C в NUS; есть не на всех шлейфах.")
+        self._hr_val.setToolTip(
+            "Число BPM по vendor-кадрам AA BB 0C (экспериментально). Это не ЭКГ и не медицинский прибор; "
+            "без хвоста 23 23 после полезной нагрузки кадр отбрасывается."
+        )
         self._att_val = QLabel("Attention —")
         self._att_val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._med_val = QLabel("Meditation —")
@@ -295,6 +468,11 @@ class MeditationMainWindow(QMainWindow):
 
         self._api_cb = QCheckBox("Agent API :8765 (POST /v1/event JSON {topic, payload})")
         self._api_cb.toggled.connect(self._toggle_api)
+
+        # Programmer bus bridge (agent → UI).
+        self._bus.subscribe("program.set_spec", self._on_program_set_spec)
+        self._bus.subscribe("program.set_timeline", self._on_program_set_timeline)
+        self._bus.subscribe("program.stop", lambda _p: self._prog_stop())
 
         self._plot_cb = QCheckBox("График (Attention / Meditation)")
         self._plot_cb.setEnabled(self._plot_available)
@@ -577,22 +755,9 @@ class MeditationMainWindow(QMainWindow):
         self._status = QLabel("")
         self._stats = QLabel("")
 
-        # Center-top: source + stats + compact metrics.
+        # Center: source, stats, then plot blocks (HR first — swapped with A/M), then bands.
         mid_lay.addWidget(self._src_label)
         mid_lay.addWidget(self._stats)
-        # Metrics header row (compact): "Метрики  Hz  <value>"
-        metrics_row = QWidget()
-        metrics_row_lay = QHBoxLayout(metrics_row)
-        metrics_row_lay.setContentsMargins(0, 0, 0, 0)
-        metrics_row_lay.addWidget(QLabel("Метрики"))
-        metrics_row_lay.addSpacing(10)
-        metrics_row_lay.addWidget(QLabel("Hz"))
-        metrics_row_lay.addWidget(self._hz_val)
-        metrics_row_lay.addSpacing(16)
-        metrics_row_lay.addWidget(QLabel("HR (exp)"))
-        metrics_row_lay.addWidget(self._hr_val)
-        metrics_row_lay.addStretch(1)
-        mid_lay.addWidget(metrics_row)
 
         # Left panel content (controls-only).
         sess_row = QWidget()
@@ -607,20 +772,45 @@ class MeditationMainWindow(QMainWindow):
         left_lay.addWidget(self._eeg_bin_cb)
         left_lay.addWidget(self._eeg_bin_box)
 
-        # Middle panel: plot controls + plots.
-        plot_row = QWidget()
-        plot_row_lay = QHBoxLayout(plot_row)
-        plot_row_lay.setContentsMargins(0, 0, 0, 0)
-        plot_row_lay.addWidget(self._plot_cb)
-        plot_row_lay.addSpacing(10)
-        plot_row_lay.addWidget(self._att_val)
-        plot_row_lay.addSpacing(6)
-        plot_row_lay.addWidget(self._med_val)
-        plot_row_lay.addStretch(1)
-        plot_row_lay.addWidget(self._plot_clear_btn)
-        mid_lay.addWidget(plot_row)
-        if self._plot_available:
-            self._init_plot_widgets(mid_lay)
+        # Manual noise (background) — independent from EEG stream.
+        noise_row = QWidget()
+        noise_lay = QHBoxLayout(noise_row)
+        noise_lay.setContentsMargins(0, 0, 0, 0)
+        self._noise_cb = QCheckBox("Noise (фон)")
+        self._noise_cb.setEnabled(self._noise_available)
+        if not self._noise_available:
+            self._noise_cb.setToolTip("Установите audio extras: pip install -e \".[audio]\"")
+        self._noise_cb.toggled.connect(self._toggle_noise)
+        self._noise_vol_spin = QDoubleSpinBox()
+        self._noise_vol_spin.setRange(0.0, 1.0)
+        self._noise_vol_spin.setSingleStep(0.01)
+        self._noise_vol_spin.setValue(float(self._noise_vol))
+        self._noise_vol_spin.setSuffix(" vol")
+        self._noise_vol_spin.setEnabled(self._noise_available)
+        self._noise_vol_spin.valueChanged.connect(self._noise_vol_changed)
+        self._noise_color_cb = QComboBox()
+        self._noise_color_cb.setEnabled(self._noise_available)
+        self._noise_color_cb.addItem("White", userData="white")
+        self._noise_color_cb.addItem("Pink", userData="pink")
+        self._noise_color_cb.addItem("Brown", userData="brown")
+        self._noise_color_cb.setCurrentIndex(0)
+        self._noise_color_cb.currentIndexChanged.connect(self._noise_color_changed)
+        noise_lay.addWidget(self._noise_cb)
+        noise_lay.addStretch(1)
+        noise_lay.addWidget(QLabel("Color"))
+        noise_lay.addWidget(self._noise_color_cb)
+        noise_lay.addWidget(QLabel("Vol"))
+        noise_lay.addWidget(self._noise_vol_spin)
+        left_lay.addWidget(noise_row)
+
+        # Middle panel: HR block (above A/M — user-requested swap), then Attention/Meditation.
+        self._hr_group = QGroupBox("Пульс (exp)")
+        self._hr_group.setToolTip(
+            "Ориентир по vendor-кадрам, не ЭКГ. Пульс вынесем на эталон / CSE — панель пока вторична."
+        )
+        hr_block_lay = QVBoxLayout(self._hr_group)
+        hr_block_lay.setContentsMargins(8, 4, 8, 4)
+        hr_block_lay.setSpacing(4)
 
         hr_plot_row = QWidget()
         hr_plot_row_lay = QHBoxLayout(hr_plot_row)
@@ -629,17 +819,26 @@ class MeditationMainWindow(QMainWindow):
         self._hr_plot_cb.setEnabled(self._plot_available)
         if not self._plot_available:
             self._hr_plot_cb.setToolTip("PySide6.QtCharts недоступен в текущей установке.")
+        else:
+            self._hr_plot_cb.setToolTip(
+                "Линия оценки BPM из тех же кадров, что и HR (exp); не кривая ЭКГ."
+            )
         self._hr_plot_cb.toggled.connect(self._toggle_hr_plot)
         self._hr_plot_clear_btn = QPushButton("Очистить график HR")
         self._hr_plot_clear_btn.setEnabled(self._plot_available)
         self._hr_plot_clear_btn.clicked.connect(self._clear_hr_plot)
         self._hr_plot_clear_btn.setVisible(False)
+        self._hr_now_lbl = QLabel("BPM")
+        self._hr_now_lbl.setStyleSheet("color: palette(mid);")
         hr_plot_row_lay.addWidget(self._hr_plot_cb)
+        hr_plot_row_lay.addWidget(self._hr_now_lbl)
+        hr_plot_row_lay.addWidget(self._hr_val)
         hr_plot_row_lay.addStretch(1)
         hr_plot_row_lay.addWidget(self._hr_plot_clear_btn)
-        mid_lay.addWidget(hr_plot_row)
+        hr_block_lay.addWidget(hr_plot_row)
         if self._plot_available:
-            self._init_hr_plot_widgets(mid_lay)
+            self._init_hr_plot_widgets(hr_block_lay)
+        mid_lay.addWidget(self._hr_group)
 
         # Bands chart: compact by default; optional Full toggle.
         self._bands_box = QGroupBox("Bands")
@@ -679,12 +878,67 @@ class MeditationMainWindow(QMainWindow):
         if self._plot_available:
             self._init_bands_plot_widgets(blay)
 
-        self._genmon_box = QGroupBox("Generator monitor")
-        mid_lay.addWidget(self._genmon_box)
-        gm_form = QFormLayout(self._genmon_box)
+        self._am_group = QGroupBox("Attention / Meditation")
+        self._am_group.setToolTip("Сигнальные индикаторы с шлема; кривые 0…100.")
+        am_block_lay = QVBoxLayout(self._am_group)
+        am_block_lay.setContentsMargins(8, 4, 8, 4)
+        am_block_lay.setSpacing(4)
+        plot_row = QWidget()
+        plot_row_lay = QHBoxLayout(plot_row)
+        plot_row_lay.setContentsMargins(0, 0, 0, 0)
+        plot_row_lay.addWidget(self._plot_cb)
+        plot_row_lay.addSpacing(10)
+        plot_row_lay.addWidget(self._att_val)
+        plot_row_lay.addSpacing(6)
+        plot_row_lay.addWidget(self._med_val)
+        plot_row_lay.addStretch(1)
+        plot_row_lay.addWidget(self._plot_clear_btn)
+        am_block_lay.addWidget(plot_row)
+        if self._plot_available:
+            self._init_plot_widgets(am_block_lay)
+        mid_lay.addWidget(self._am_group)
+
+        self._tone_group = QGroupBox("EEG → Tone (монитор)")
+        self._tone_group.setToolTip(
+            "Сглаженные f и громкость, которые уходят в движок тона. Mono: f + vol; stereo: fL, fR, vL, vR."
+        )
+        tone_lay = QVBoxLayout(self._tone_group)
+        tone_lay.setContentsMargins(8, 4, 8, 4)
+        tone_lay.setSpacing(4)
+
+        tone_row = QWidget()
+        tone_row_lay = QHBoxLayout(tone_row)
+        tone_row_lay.setContentsMargins(0, 0, 0, 0)
+        self._tone_plot_cb = QCheckBox("График (f / vol)")
+        self._tone_plot_cb.setEnabled(self._plot_available)
+        if not self._plot_available:
+            self._tone_plot_cb.setToolTip("PySide6.QtCharts недоступен в текущей установке.")
+        else:
+            self._tone_plot_cb.setToolTip(
+                "Переключение Mono/Stereo в настройках EEG→Tone очищает кривую: разные сетки осей (Hz / vol)."
+            )
+        self._tone_plot_cb.toggled.connect(self._toggle_tone_plot)
+        self._tone_vals_lbl = QLabel("—")
+        self._tone_vals_lbl.setStyleSheet("color: palette(mid);")
+        self._tone_vals_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._tone_plot_clear_btn = QPushButton("Очистить")
+        self._tone_plot_clear_btn.setEnabled(self._plot_available)
+        self._tone_plot_clear_btn.setVisible(False)
+        self._tone_plot_clear_btn.clicked.connect(self._clear_tone_plot)
+        tone_row_lay.addWidget(self._tone_plot_cb)
+        tone_row_lay.addSpacing(10)
+        tone_row_lay.addWidget(self._tone_vals_lbl, 1)
+        tone_row_lay.addWidget(self._tone_plot_clear_btn)
+        tone_lay.addWidget(tone_row)
+
+        # Numeric monitor line (raised up into the block, not at the bottom).
         self._genmon_line = QLabel("idle")
         self._genmon_line.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        gm_form.addRow("State", self._genmon_line)
+        tone_lay.addWidget(self._genmon_line)
+
+        if self._plot_available:
+            self._init_tone_plot_widgets(tone_lay)
+        mid_lay.addWidget(self._tone_group)
         mid_lay.addStretch(1)
         if self._ble_address:
             row = QWidget()
@@ -747,6 +1001,13 @@ class MeditationMainWindow(QMainWindow):
             self._eeg_tone_mode = str(data)
         self._eeg_tone_stereo_box.setVisible(self._eeg_tone_enabled and self._eeg_tone_mode == "stereo")
         self._stop_eeg_tone()
+        if self._plot_available:
+            self._clear_tone_plot()
+            self._apply_tone_plot_series_visibility()
+            if self._tone_plot_enabled:
+                self._refresh_tone_plot(force=True)
+        if hasattr(self, "_tone_vals_lbl"):
+            self._set_tone_base_text("—")
 
     def _tone_l_freq_src_changed(self, _idx: int) -> None:
         data = self._tone_l_freq_src.currentData()
@@ -834,6 +1095,515 @@ class MeditationMainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _ensure_noise_stream(self) -> bool:
+        if not self._noise_available:
+            return False
+        if self._noise_stream is None:
+            try:
+                self._noise_stream = ToneSweepStream(StreamConfig(sample_rate=48000, channels=2))
+                self._noise_stream.set_fades(float(self._noise_fade_in_s), float(self._noise_fade_out_s))
+                self._noise_stream.start()
+            except Exception as exc:
+                self._status.setText(f"Audio ошибка (noise): {exc}")
+                self._noise_stream = None
+                if hasattr(self, "_noise_cb"):
+                    self._noise_cb.setChecked(False)
+                return False
+        return True
+
+    def _stop_noise_stream(self) -> None:
+        st = self._noise_stream
+        self._noise_stream = None
+        if st is not None:
+            try:
+                st.stop()
+            except Exception:
+                pass
+
+    def _toggle_noise(self, on: bool) -> None:
+        self._noise_enabled = bool(on)
+        if not self._noise_enabled:
+            self._request_noise_fadeout_and_close()
+            self._refresh_tone_monitor_labels()
+            return
+        if not self._ensure_noise_stream():
+            return
+        try:
+            self._noise_stream.set_volume(float(self._noise_vol))
+            self._noise_stream.play_noise(color=str(self._noise_color))
+        except Exception as exc:
+            self._status.setText(f"Audio ошибка (noise): {exc}")
+            self._stop_noise_stream()
+            if hasattr(self, "_noise_cb"):
+                self._noise_cb.setChecked(False)
+            return
+        self._refresh_tone_monitor_labels()
+
+    def _noise_vol_changed(self, v: float) -> None:
+        self._noise_vol = float(v)
+        if self._noise_enabled and self._noise_stream is not None:
+            try:
+                self._noise_stream.set_volume(float(self._noise_vol))
+            except Exception:
+                pass
+        self._refresh_tone_monitor_labels()
+
+    def _noise_color_changed(self, _idx: int) -> None:
+        data = None
+        if hasattr(self, "_noise_color_cb"):
+            data = self._noise_color_cb.currentData()
+        c = str(data or "white")
+        if c not in ("white", "pink", "brown"):
+            c = "white"
+        self._noise_color = c
+        if self._noise_enabled and self._noise_stream is not None:
+            try:
+                # Restart noise to reset filter state deterministically.
+                self._noise_stream.play_noise(color=str(self._noise_color))
+            except Exception:
+                pass
+        self._refresh_tone_monitor_labels()
+
+    def _request_noise_fadeout_and_close(self) -> None:
+        st = self._noise_stream
+        if st is None:
+            return
+        try:
+            st.idle()
+        except Exception:
+            self._stop_noise_stream()
+            return
+        self._noise_stop_gen += 1
+        gen = int(self._noise_stop_gen)
+        ms = int((float(self._noise_fade_out_s) + 0.10) * 1000.0)
+        QTimer.singleShot(ms, lambda: self._maybe_close_noise_stream(gen))
+
+    def _maybe_close_noise_stream(self, gen: int) -> None:
+        if int(gen) != int(self._noise_stop_gen):
+            return
+        if self._noise_enabled:
+            return
+        self._stop_noise_stream()
+
+    def _set_tone_base_text(self, text: str) -> None:
+        self._tone_base_text = str(text or "—")
+        self._refresh_tone_monitor_labels()
+
+    def _refresh_tone_monitor_labels(self) -> None:
+        # Show tone values and optionally noise volume in the same compact line.
+        if hasattr(self, "_tone_vals_lbl"):
+            base = str(getattr(self, "_tone_base_text", "—"))
+            if base.strip() in ("", "—"):
+                base = "—"
+            suffix = (
+                f" | noise {str(self._noise_color)} v={float(self._noise_vol):.2f}"
+                if self._noise_enabled
+                else ""
+            )
+            self._tone_vals_lbl.setText(f"{base}{suffix}" if base != "—" else (f"—{suffix}"))
+
+    # --- Programmer (agent-driven) ---
+    def _prog_sink_changed(self, text: str) -> None:
+        self._prog_sink_url = str(text or "").strip()
+
+    def _prog_run_clicked(self) -> None:
+        if hasattr(self, "_prog_tabs") and int(self._prog_tabs.currentIndex()) == 1:
+            self._prog_start_timeline(str(self._prog_tl_edit.toPlainText()))
+            return
+        spec = str(self._prog_spec_edit.text() if hasattr(self, "_prog_spec_edit") else self._prog_spec)
+        self._prog_start(spec)
+
+    def _prog_stop_clicked(self) -> None:
+        self._prog_stop()
+
+    def _on_program_set_spec(self, payload: Any) -> None:
+        # payload can be {"spec": "..."} or raw string.
+        spec = ""
+        if isinstance(payload, dict):
+            spec = str(payload.get("spec") or "")
+        else:
+            spec = str(payload or "")
+        spec = spec.strip()
+        if spec:
+            if hasattr(self, "_prog_spec_edit"):
+                self._prog_spec_edit.setText(spec)
+            self._prog_start(spec)
+
+    def _on_program_set_timeline(self, payload: Any) -> None:
+        text = ""
+        if isinstance(payload, dict):
+            text = str(payload.get("timeline") or payload.get("text") or "")
+        else:
+            text = str(payload or "")
+        text = text.strip()
+        if not text:
+            return
+        if hasattr(self, "_prog_tabs"):
+            self._prog_tabs.setCurrentIndex(1)
+        if hasattr(self, "_prog_tl_edit"):
+            self._prog_tl_edit.setPlainText(text)
+        self._prog_start_timeline(text)
+
+    def _ensure_prog_tone_stream(self) -> bool:
+        if not self._prog_available:
+            return False
+        if self._prog_tone_stream is None:
+            try:
+                self._prog_tone_stream = ToneSweepStream(StreamConfig(sample_rate=48000, channels=2))
+                self._prog_tone_stream.set_fades(0.02, 0.08)
+                self._prog_tone_stream.start()
+            except Exception as exc:
+                self._status.setText(f"Audio ошибка (prog tone): {exc}")
+                self._prog_tone_stream = None
+                return False
+        return True
+
+    def _ensure_prog_noise_stream(self) -> bool:
+        if not self._prog_available:
+            return False
+        if self._prog_noise_stream is None:
+            try:
+                self._prog_noise_stream = ToneSweepStream(StreamConfig(sample_rate=48000, channels=2))
+                self._prog_noise_stream.set_fades(0.02, 0.08)
+                self._prog_noise_stream.start()
+            except Exception as exc:
+                self._status.setText(f"Audio ошибка (prog noise): {exc}")
+                self._prog_noise_stream = None
+                return False
+        return True
+
+    def _prog_parse_spec(self, spec: str) -> dict[str, Any]:
+        # Supported: "<carrier>+<beat>/<amp>" and "<color>/<amp>" and "off|-"
+        s = (spec or "").strip()
+        if not s or s in ("-", "off", "idle"):
+            return {"off": True}
+        out: dict[str, Any] = {"off": False, "tone": None, "noise": None, "sweep": None}
+        for part in s.split():
+            p = part.strip()
+            if not p:
+                continue
+            if p in ("-", "off", "idle"):
+                out["off"] = True
+                continue
+            if p.startswith("sweep:"):
+                # sweep:f0->f1/dur/amp
+                try:
+                    rhs = p[len("sweep:") :]
+                    arrow = rhs.split("->", 1)
+                    f0 = float(arrow[0])
+                    tail = arrow[1]
+                    bits = tail.split("/")
+                    f1 = float(bits[0])
+                    dur = float(bits[1]) if len(bits) > 1 else 10.0
+                    amp = float(bits[2]) if len(bits) > 2 else 0.6
+                    if amp > 1.0:
+                        amp = amp / 100.0
+                    amp = 0.0 if amp < 0.0 else 1.0 if amp > 1.0 else amp
+                    out["sweep"] = {"f0": f0, "f1": f1, "dur": dur, "vol": amp}
+                except Exception:
+                    continue
+                continue
+            if "+" in p and "/" in p:
+                # binaural: carrier+beat/amp
+                try:
+                    left = p.split("/", 1)[0]
+                    amp_raw = p.split("/", 1)[1]
+                    carrier_raw, beat_raw = left.split("+", 1)
+                    carrier = float(carrier_raw)
+                    beat = float(beat_raw)
+                    amp = float(amp_raw)
+                    if amp > 1.0:
+                        amp = amp / 100.0
+                    amp = 0.0 if amp < 0.0 else 1.0 if amp > 1.0 else amp
+                    l = float(carrier) - float(beat) * 0.5
+                    r = float(carrier) + float(beat) * 0.5
+                    out["tone"] = {"l_hz": l, "r_hz": r, "vol": amp}
+                except Exception:
+                    continue
+                continue
+            if "/" in p:
+                # noise color/amp
+                try:
+                    c_raw, a_raw = p.split("/", 1)
+                    color = str(c_raw).lower().strip()
+                    if color not in ("white", "pink", "brown"):
+                        continue
+                    vol = float(a_raw)
+                    if vol > 1.0:
+                        vol = vol / 100.0
+                    vol = 0.0 if vol < 0.0 else 1.0 if vol > 1.0 else vol
+                    out["noise"] = {"color": color, "vol": vol}
+                except Exception:
+                    continue
+        return out
+
+    def _prog_start(self, spec: str) -> None:
+        self._prog_spec = str(spec or "").strip()
+        parsed = self._prog_parse_spec(self._prog_spec)
+        if parsed.get("off"):
+            self._prog_stop()
+            return
+        sweep = parsed.get("sweep")
+        tone = parsed.get("tone")
+        noise = parsed.get("noise")
+        if sweep and self._ensure_prog_tone_stream():
+            self._prog_tone_vol = float(sweep["vol"])
+            try:
+                self._prog_tone_stream.set_volume_lr(self._prog_tone_vol, self._prog_tone_vol)
+                self._prog_tone_stream.play_sweep(
+                    f0_hz=float(sweep["f0"]),
+                    f1_hz=float(sweep["f1"]),
+                    duration_s=float(sweep["dur"]),
+                    log=False,
+                    loop=False,
+                )
+            except Exception as exc:
+                self._status.setText(f"Audio ошибка (prog sweep): {exc}")
+        elif tone and self._ensure_prog_tone_stream():
+            self._prog_tone_left_hz = float(tone["l_hz"])
+            self._prog_tone_right_hz = float(tone["r_hz"])
+            self._prog_tone_vol = float(tone["vol"])
+            try:
+                self._prog_tone_stream.set_volume_lr(self._prog_tone_vol, self._prog_tone_vol)
+                self._prog_tone_stream.play_binaural(self._prog_tone_left_hz, self._prog_tone_right_hz)
+            except Exception as exc:
+                self._status.setText(f"Audio ошибка (prog tone): {exc}")
+        if noise and self._ensure_prog_noise_stream():
+            self._prog_noise_color = str(noise["color"])
+            self._prog_noise_vol = float(noise["vol"])
+            try:
+                self._prog_noise_stream.set_volume(float(self._prog_noise_vol))
+                self._prog_noise_stream.play_noise(color=self._prog_noise_color)
+            except Exception as exc:
+                self._status.setText(f"Audio ошибка (prog noise): {exc}")
+        self._prog_running = True
+        if hasattr(self, "_prog_run_btn"):
+            # Allow re-apply without stop in Spec mode.
+            self._prog_run_btn.setEnabled(self._prog_available)
+            if hasattr(self, "_prog_tabs") and int(self._prog_tabs.currentIndex()) == 0:
+                self._prog_run_btn.setText("Apply")
+        if hasattr(self, "_prog_stop_btn"):
+            self._prog_stop_btn.setEnabled(True)
+        self._prog_status_lbl.setText(f"running: {self._prog_spec}")
+        self._write_event(
+            "program.action",
+            {"action": {"command": "set_spec", "by": "ui" if self.sender() is not None else "agent", "spec": str(self._prog_spec)}},
+        )
+        self._prog_emit_status()
+
+    def _prog_clear_timers(self) -> None:
+        if not getattr(self, "_prog_timers", None):
+            return
+        for t in list(self._prog_timers):
+            try:
+                t.stop()
+            except Exception:
+                pass
+            try:
+                t.deleteLater()
+            except Exception:
+                pass
+        self._prog_timers.clear()
+
+    def _prog_start_timeline(self, text: str) -> None:
+        self._prog_clear_timers()
+        self._prog_timeline_running = True
+        items: list[tuple[float, str]] = []
+        for raw in (text or "").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "#" in line:
+                line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) < 2:
+                continue
+            ts, spec = parts[0].strip(), parts[1].strip()
+            tsec = self._parse_mmss(ts)
+            if tsec is None:
+                continue
+            items.append((float(tsec), spec))
+        items.sort(key=lambda x: x[0])
+        if not items:
+            self._prog_status_lbl.setText("timeline: пусто")
+            self._prog_timeline_running = False
+            return
+        t0 = time.monotonic()
+        for at_s, spec in items:
+            delay_ms = max(0, int((float(at_s) - 0.0) * 1000.0))
+            tm = QTimer(self)
+            tm.setSingleShot(True)
+            tm.timeout.connect(lambda s=spec: self._prog_start(s))
+            tm.start(delay_ms)
+            self._prog_timers.append(tm)
+        self._prog_status_lbl.setText(f"timeline: {len(items)} шаг(ов)")
+        self._write_event(
+            "program.action",
+            {"action": {"command": "set_timeline", "by": "ui", "timeline": str(text)}},
+        )
+        self._prog_emit_status()
+
+    @staticmethod
+    def _parse_mmss(ts: str) -> float | None:
+        # accepts m:s, mm:ss, hh:mm:ss
+        try:
+            bits = [int(b) for b in ts.strip().split(":")]
+        except Exception:
+            return None
+        if len(bits) == 2:
+            m, s = bits
+            return float(m * 60 + s)
+        if len(bits) == 3:
+            h, m, s = bits
+            return float(h * 3600 + m * 60 + s)
+        return None
+
+    def _prog_stop(self) -> None:
+        self._prog_clear_timers()
+        self._prog_timeline_running = False
+        self._prog_running = False
+        # tone
+        if self._prog_tone_stream is not None:
+            try:
+                self._prog_tone_stream.idle()
+            except Exception:
+                pass
+            try:
+                self._prog_tone_stream.stop()
+            except Exception:
+                pass
+            self._prog_tone_stream = None
+        # noise
+        if self._prog_noise_stream is not None:
+            try:
+                self._prog_noise_stream.idle()
+            except Exception:
+                pass
+            try:
+                self._prog_noise_stream.stop()
+            except Exception:
+                pass
+            self._prog_noise_stream = None
+        if hasattr(self, "_prog_run_btn"):
+            self._prog_run_btn.setEnabled(self._prog_available)
+            self._prog_run_btn.setText("Run")
+        if hasattr(self, "_prog_stop_btn"):
+            self._prog_stop_btn.setEnabled(False)
+        if hasattr(self, "_prog_status_lbl"):
+            self._prog_status_lbl.setText("idle")
+        self._write_event("program.action", {"action": {"command": "stop", "by": "ui"}})
+        self._prog_emit_status()
+
+    def _prog_emit_status(self) -> None:
+        now = time.monotonic()
+        if (now - float(self._prog_last_status_at)) < float(self._prog_status_min_s):
+            return
+        self._prog_last_status_at = now
+        status = {
+            "running": bool(self._prog_running),
+            "spec": str(self._prog_spec),
+            "tone": {"l_hz": float(self._prog_tone_left_hz), "r_hz": float(self._prog_tone_right_hz), "vol": float(self._prog_tone_vol)}
+            if self._prog_running
+            else None,
+            "noise": {"color": str(self._prog_noise_color), "vol": float(self._prog_noise_vol)} if self._prog_running else None,
+        }
+        self._bus.publish("program.status", status)
+        if str(self._prog_sink_url).strip():
+            self._post_sink_event("program.status", status)
+
+    def _post_sink_event(self, topic: str, payload: Any) -> None:
+        url = str(self._prog_sink_url).strip()
+        if not url:
+            return
+        body = json.dumps({"topic": str(topic), "payload": payload}, ensure_ascii=False).encode("utf-8")
+
+        def _do() -> None:
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=body,
+                    headers={"Content-Type": "application/json; charset=utf-8"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=1.5) as _resp:
+                    pass
+            except Exception:
+                pass
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _add_marker_clicked(self) -> None:
+        label = str(self._marker_edit.text() if hasattr(self, "_marker_edit") else "").strip()
+        if not label:
+            return
+        try:
+            rating = int(self._marker_rating.value()) if hasattr(self, "_marker_rating") else 0
+        except Exception:
+            rating = 0
+        note = str(self._marker_note.text() if hasattr(self, "_marker_note") else "").strip()
+        self._write_event("marker", {"marker": {"label": label, "rating": rating, "note": note or None}})
+        try:
+            self._marker_edit.clear()
+            if hasattr(self, "_marker_note"):
+                self._marker_note.clear()
+        except Exception:
+            pass
+
+    def _emit_observation(self) -> None:
+        # Aggregate last N seconds into a single observation record.
+        if not self._session_log_active:
+            return
+        now = time.monotonic()
+        cutoff = now - float(self._obs_window_s)
+        pts = [p for p in list(self._obs_points) if float(p.get("t", 0.0)) >= cutoff]
+        if not pts:
+            return
+
+        def _stats(vals: list[int]) -> dict[str, float] | None:
+            if not vals:
+                return None
+            n = float(len(vals))
+            mean = float(sum(vals)) / n
+            mn = float(min(vals))
+            mx = float(max(vals))
+            var = float(sum((float(v) - mean) ** 2 for v in vals)) / max(1.0, n)
+            return {"mean": mean, "min": mn, "max": mx, "std": float(math.sqrt(var))}
+
+        att_s = _stats([int(p["att"]) for p in pts if p.get("att") is not None])
+        med_s = _stats([int(p["med"]) for p in pts if p.get("med") is not None])
+        hr_s = _stats([int(p["hr"]) for p in pts if p.get("hr") is not None])
+        sq_vals = [int(p["sq"]) for p in pts if p.get("sq") is not None]
+        rssi_vals = [int(p["rssi"]) for p in pts if p.get("rssi") is not None]
+        bands_last = None
+        for p in reversed(pts):
+            b = p.get("bands")
+            if isinstance(b, dict):
+                bands_last = b
+                break
+
+        prog = {
+            "running": bool(self._prog_running),
+            "spec": str(self._prog_spec),
+            "tone": {"l_hz": float(self._prog_tone_left_hz), "r_hz": float(self._prog_tone_right_hz), "vol": float(self._prog_tone_vol)}
+            if self._prog_running
+            else None,
+            "noise": {"color": str(self._prog_noise_color), "vol": float(self._prog_noise_vol)} if self._prog_running else None,
+        }
+
+        self._write_event(
+            "observation",
+            {
+                "window_s": float(self._obs_window_s),
+                "eeg": {"attention": att_s, "meditation": med_s},
+                "hr": hr_s,
+                "quality": {"sq_last": self._last_signal_quality, "sq": _stats(sq_vals), "rssi": _stats(rssi_vals)},
+                "bands_last": bands_last,
+                "program": prog,
+            },
+        )
+
     def _toggle_recording(self, on: bool) -> None:
         self._session_log_active = bool(on)
         self._record_btn.setText("Запись: Вкл" if self._session_log_active else "Запись: Выкл")
@@ -844,6 +1614,11 @@ class MeditationMainWindow(QMainWindow):
                 except OSError:
                     pass
                 self._session_log_file = None
+            if self._obs_timer.isActive():
+                self._obs_timer.stop()
+        else:
+            if self._ble_thread is not None:
+                self._obs_timer.start()
 
     def _default_session_log_path(self) -> Path:
         ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
@@ -1266,7 +2041,7 @@ class MeditationMainWindow(QMainWindow):
         if not self._plot_available:
             return
         series_hr = QLineSeries()
-        series_hr.setName("HR (BPM, exp)")
+        series_hr.setName("HR оценка (BPM), не ЭКГ")
         chart = QChart()
         chart.addSeries(series_hr)
         chart.legend().setVisible(True)
@@ -1351,7 +2126,261 @@ class MeditationMainWindow(QMainWindow):
             self._hr_axis_y.setRange(lo, hi)
         self._series_hr.replace([QPointF(x, y) for x, y in pts])
 
+    def _toggle_tone_plot(self, on: bool) -> None:
+        if not self._plot_available:
+            return
+        self._tone_plot_enabled = bool(on)
+        if self._tone_chart_view is not None:
+            self._tone_chart_view.setVisible(self._tone_plot_enabled)
+        self._tone_plot_clear_btn.setVisible(self._tone_plot_enabled)
+        if self._tone_plot_enabled:
+            self._tone_plot_timer.start()
+        else:
+            if self._tone_plot_timer is not None:
+                self._tone_plot_timer.stop()
+        self._apply_tone_plot_series_visibility()
+        if self._tone_plot_enabled:
+            self._refresh_tone_plot(force=True)
+
+    def _tone_plot_tick(self) -> None:
+        if not self._tone_plot_enabled or not self._tone_plot_dirty:
+            return
+        now = time.monotonic()
+        if now - self._tone_plot_last_redraw < self._tone_plot_min_redraw_s:
+            return
+        self._tone_plot_last_redraw = now
+        self._tone_plot_dirty = False
+        self._refresh_tone_plot()
+
+    def _init_tone_plot_widgets(self, lay: QVBoxLayout) -> None:
+        if not self._plot_available:
+            return
+        s_f = QLineSeries()
+        s_f.setName("f, Hz (mono)")
+        s_v = QLineSeries()
+        s_v.setName("vol (mono)")
+        s_fl = QLineSeries()
+        s_fl.setName("fL, Hz")
+        s_fr = QLineSeries()
+        s_fr.setName("fR, Hz")
+        s_vl = QLineSeries()
+        s_vl.setName("vL")
+        s_vr = QLineSeries()
+        s_vr.setName("vR")
+        chart = QChart()
+        for s in (s_f, s_v, s_fl, s_fr, s_vl, s_vr):
+            chart.addSeries(s)
+        chart.legend().setVisible(True)
+        chart.setBackgroundRoundness(0)
+        ax = QValueAxis()
+        ax.setTitleText("t, s")
+        ax.setRange(0, self._tone_plot_window_s)
+        ax.setLabelFormat("%.0f")
+        ay_h = QValueAxis()
+        ay_h.setRange(0, 2000)
+        ay_h.setTitleText("Hz")
+        ay_h.setLabelFormat("%.0f")
+        ay_v = QValueAxis()
+        ay_v.setRange(0, 0.25)
+        ay_v.setTitleText("vol")
+        ay_v.setLabelFormat("%.2f")
+        chart.addAxis(ax, Qt.AlignmentFlag.AlignBottom)
+        chart.addAxis(ay_h, Qt.AlignmentFlag.AlignLeft)
+        chart.addAxis(ay_v, Qt.AlignmentFlag.AlignRight)
+        s_f.attachAxis(ax)
+        s_f.attachAxis(ay_h)
+        s_v.attachAxis(ax)
+        s_v.attachAxis(ay_v)
+        s_fl.attachAxis(ax)
+        s_fl.attachAxis(ay_h)
+        s_fr.attachAxis(ax)
+        s_fr.attachAxis(ay_h)
+        s_vl.attachAxis(ax)
+        s_vl.attachAxis(ay_v)
+        s_vr.attachAxis(ax)
+        s_vr.attachAxis(ay_v)
+        view = QChartView(chart)
+        view.setMinimumHeight(150)
+        view.setVisible(False)
+        lay.addWidget(view)
+        self._series_tone_f = s_f
+        self._series_tone_v = s_v
+        self._series_tone_f_l = s_fl
+        self._series_tone_f_r = s_fr
+        self._series_tone_v_l = s_vl
+        self._series_tone_v_r = s_vr
+        self._tone_axis_x = ax
+        self._tone_axis_y_hz = ay_h
+        self._tone_axis_y_vol = ay_v
+        self._tone_chart_view = view
+        self._apply_tone_plot_series_visibility()
+        self._tone_plot_timer = QTimer(self)
+        self._tone_plot_timer.setInterval(120)
+        self._tone_plot_timer.timeout.connect(self._tone_plot_tick)
+
+    def _apply_tone_plot_series_visibility(self) -> None:
+        m = self._eeg_tone_mode == "stereo"
+        for s, vis in (
+            (self._series_tone_f, not m),
+            (self._series_tone_v, not m),
+            (self._series_tone_f_l, m),
+            (self._series_tone_f_r, m),
+            (self._series_tone_v_l, m),
+            (self._series_tone_v_r, m),
+        ):
+            if s is not None:
+                s.setVisible(vis)
+        if self._tone_chart_view is not None and self._tone_chart_view.chart() is not None:
+            self._tone_chart_view.chart().legend().setVisible(True)
+
+    def _append_tone_plot_sample(self) -> None:
+        if not self._plot_available or not self._tone_plot_enabled:
+            return
+        t = time.monotonic() - self._tone_t0
+        if self._eeg_tone_mode == "stereo":
+            self._tone_s_t.append(t)
+            self._tone_s_f_l.append(float(self._eeg_tone_f_l))
+            self._tone_s_f_r.append(float(self._eeg_tone_f_r))
+            self._tone_s_v_l.append(float(self._eeg_tone_v_l))
+            self._tone_s_v_r.append(float(self._eeg_tone_v_r))
+        else:
+            self._tone_m_t.append(t)
+            self._tone_m_f.append(float(self._eeg_tone_f_hz))
+            self._tone_m_v.append(float(self._eeg_tone_vol))
+        self._tone_plot_dirty = True
+
+    def _clear_tone_plot(self) -> None:
+        if not self._plot_available:
+            return
+        self._tone_t0 = time.monotonic()
+        for d in (
+            self._tone_m_t,
+            self._tone_m_f,
+            self._tone_m_v,
+            self._tone_s_t,
+            self._tone_s_f_l,
+            self._tone_s_f_r,
+            self._tone_s_v_l,
+            self._tone_s_v_r,
+        ):
+            d.clear()
+        self._tone_plot_dirty = True
+        for s in (
+            self._series_tone_f,
+            self._series_tone_v,
+            self._series_tone_f_l,
+            self._series_tone_f_r,
+            self._series_tone_v_l,
+            self._series_tone_v_r,
+        ):
+            if s is not None:
+                s.clear()
+        if self._tone_axis_x is not None:
+            self._tone_axis_x.setRange(0, self._tone_plot_window_s)
+        if self._tone_axis_y_hz is not None:
+            self._tone_axis_y_hz.setRange(0, 2000)
+        if self._tone_axis_y_vol is not None:
+            self._tone_axis_y_vol.setRange(0, 0.25)
+
+    def _refresh_tone_plot(self, *, force: bool = False) -> None:
+        if not self._plot_available or not self._tone_plot_enabled:
+            return
+        if (
+            self._series_tone_f is None
+            or self._tone_axis_x is None
+            or self._tone_axis_y_hz is None
+            or self._tone_axis_y_vol is None
+        ):
+            return
+        is_stereo = self._eeg_tone_mode == "stereo"
+        t_deq = self._tone_s_t if is_stereo else self._tone_m_t
+        n = len(t_deq)
+        if n < 1 and not force:
+            return
+        t_end = t_deq[-1] if n else 0.0
+        t_start = max(0.0, t_end - self._tone_plot_window_s)
+        self._tone_axis_x.setRange(t_start, max(t_start + 1.0, t_end))
+
+        def _decimate(pts: list) -> list:
+            if len(pts) > 600:
+                step = int(math.ceil(len(pts) / 600))
+                return pts[::step]
+            return pts
+
+        if is_stereo:
+            row = list(
+                zip(
+                    self._tone_s_t,
+                    self._tone_s_f_l,
+                    self._tone_s_f_r,
+                    self._tone_s_v_l,
+                    self._tone_s_v_r,
+                )
+            )
+            pts_l, pts_r, pts_vl, pts_vr = [], [], [], []
+            for t, fl, fr, vl, vr in row:
+                if float(t) < t_start:
+                    continue
+                tt = float(t)
+                pts_l.append((tt, float(fl)))
+                pts_r.append((tt, float(fr)))
+                pts_vl.append((tt, float(vl)))
+                pts_vr.append((tt, float(vr)))
+            pts_l = _decimate(pts_l)
+            pts_r = _decimate(pts_r)
+            pts_vl = _decimate(pts_vl)
+            pts_vr = _decimate(pts_vr)
+            self._series_tone_f_l.replace([QPointF(x, y) for x, y in pts_l])
+            self._series_tone_f_r.replace([QPointF(x, y) for x, y in pts_r])
+            self._series_tone_v_l.replace([QPointF(x, y) for x, y in pts_vl])
+            self._series_tone_v_r.replace([QPointF(x, y) for x, y in pts_vr])
+            hz_vals = [p[1] for p in pts_l + pts_r] or [0.0, 200.0]
+            v_vals = [p[1] for p in pts_vl + pts_vr] or [0.0, 0.25]
+        else:
+            row = list(zip(self._tone_m_t, self._tone_m_f, self._tone_m_v))
+            pts_f, pts_vv = [], []
+            for t, f, v in row:
+                if float(t) < t_start:
+                    continue
+                tt = float(t)
+                pts_f.append((tt, float(f)))
+                pts_vv.append((tt, float(v)))
+            pts_f = _decimate(pts_f)
+            pts_vv = _decimate(pts_vv)
+            self._series_tone_f.replace([QPointF(x, y) for x, y in pts_f])
+            self._series_tone_v.replace([QPointF(x, y) for x, y in pts_vv])
+            hz_vals = [p[1] for p in pts_f] or [0.0, 1000.0]
+            v_vals = [p[1] for p in pts_vv] or [0.0, 0.1]
+
+        lo_h = min(hz_vals)
+        hi_h = max(hz_vals)
+        if hi_h > lo_h:
+            pad = max(5.0, (hi_h - lo_h) * 0.08)
+            y0, y1 = max(0.0, lo_h - pad), min(8000.0, hi_h + pad)
+        else:
+            y0, y1 = max(0.0, lo_h - 10.0), lo_h + 10.0
+        self._tone_axis_y_hz.setRange(y0, y1)
+
+        lo_v = min(v_vals)
+        hi_v = max(v_vals)
+        if hi_v < 1.0e-3:
+            self._tone_axis_y_vol.setRange(0, 0.3)
+        else:
+            self._tone_axis_y_vol.setRange(0, min(1.0, max(hi_v * 1.1, 0.02)))
+
     def _append_session_log(self, att: int, med: int) -> None:
+        self._write_event(
+            "eeg",
+            {
+                "eeg": {"attention": int(att), "meditation": int(med)},
+                "quality": {"sq": self._last_signal_quality, "rssi": self._ble_selected_rssi},
+            },
+        )
+
+    def _append_hr_session_log(self, bpm: int) -> None:
+        self._write_event("hr", {"hr": {"bpm": int(bpm), "source": "aabb0c_exp"}})
+
+    def _write_event(self, event_type: str, payload: dict[str, Any]) -> None:
         if not self._session_log_active:
             return
         fp = self._session_log_file
@@ -1359,40 +2388,51 @@ class MeditationMainWindow(QMainWindow):
             self._session_log_path.parent.mkdir(parents=True, exist_ok=True)
             self._session_log_file = self._session_log_path.open("a", encoding="utf-8")
             fp = self._session_log_file
+            self._write_session_start()
         if fp is None and self._session_log_path is None:
-            # Lazy-create first session log on demand.
             self._new_session_log()
             fp = self._session_log_file
             if fp is None:
                 return
-        rec = {
-            "type": "eeg",
+        if self._session_t0_mono is None:
+            self._session_t0_mono = time.monotonic()
+        rec: dict[str, Any] = {
+            "type": str(event_type),
+            "session_id": str(self._session_id),
             "timestamp_utc": datetime.now(UTC).isoformat(),
-            "eeg": {"attention": att, "meditation": med},
+            "t_monotonic_s": float(time.monotonic() - float(self._session_t0_mono)),
+            "source": "ble" if self._ble_thread is not None else ("jsonl" if self._eeg_it is not None else "ui"),
         }
+        rec.update(payload or {})
         fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
         fp.flush()
 
-    def _append_hr_session_log(self, bpm: int) -> None:
+    def _write_session_start(self) -> None:
+        # Idempotent-ish: safe to call multiple times; writes only when log is active and file exists.
         if not self._session_log_active:
             return
-        fp = self._session_log_file
-        if fp is None and self._session_log_path is not None:
-            self._session_log_path.parent.mkdir(parents=True, exist_ok=True)
-            self._session_log_file = self._session_log_path.open("a", encoding="utf-8")
-            fp = self._session_log_file
-        if fp is None and self._session_log_path is None:
-            self._new_session_log()
-            fp = self._session_log_file
-            if fp is None:
-                return
-        rec = {
-            "type": "hr",
-            "timestamp_utc": datetime.now(UTC).isoformat(),
-            "hr": {"bpm": int(bpm), "source": "aabb0c_exp"},
-        }
-        fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        fp.flush()
+        if self._session_t0_mono is None:
+            self._session_t0_mono = time.monotonic()
+        self._write_event(
+            "session_start",
+            {
+                "app": {"window": "meditation_poc"},
+                "device": {"ble_address": self._ble_address},
+                "programmer": {"spec": str(self._prog_spec)},
+            },
+        )
+
+    def _write_session_end(self) -> None:
+        if not self._session_log_active:
+            return
+        self._write_event(
+            "session_end",
+            {
+                "summary": {
+                    "duration_s": float(time.monotonic() - float(self._session_t0_mono or time.monotonic())),
+                }
+            },
+        )
 
     def _start_ble(self) -> None:
         if not self._ble_address or self._ble_thread is not None:
@@ -1401,12 +2441,18 @@ class MeditationMainWindow(QMainWindow):
         self._ble_start.setEnabled(False)
         self._ble_stop.setEnabled(True)
         self._session_started_at = time.monotonic()
+        if self._session_t0_mono is None:
+            self._session_t0_mono = time.monotonic()
+        self._write_session_start()
+        if self._session_log_active:
+            self._obs_timer.start()
         self._last_metric_at = None
         self._last_hr_bpm = None
         self._last_hr_at = None
         self._hr_val.setText("—")
         if self._plot_available:
             self._clear_hr_plot()
+            self._clear_tone_plot()
         self._metric_times.clear()
         th = BleNotifyThread(
             self._ble_address,
@@ -1429,6 +2475,8 @@ class MeditationMainWindow(QMainWindow):
             self._ble_thread.request_stop()
             self._status.setText("BLE: остановка…")
         self._rssi_timer.stop()
+        if self._obs_timer.isActive():
+            self._obs_timer.stop()
 
     def _on_ble_metrics(self, att: int, med: int) -> None:
         now = time.monotonic()
@@ -1445,6 +2493,17 @@ class MeditationMainWindow(QMainWindow):
         self._med_val.setText(f"Meditation {int(med)}")
         self._bus.publish("eeg.metrics", {"attention": att, "meditation": med})
         self._append_session_log(att, med)
+        self._obs_points.append(
+            {
+                "t": float(now),
+                "att": int(att),
+                "med": int(med),
+                "sq": self._last_signal_quality,
+                "rssi": self._ble_selected_rssi,
+                "bands": self._last_bands,
+                "hr": self._last_hr_bpm,
+            }
+        )
         self._append_plot_point(att, med)
         self._apply_eeg_tone()
         self._apply_eeg_binaural()
@@ -1499,6 +2558,7 @@ class MeditationMainWindow(QMainWindow):
         self._refresh_bands_ui()
         if self._bands_plot_enabled and self._plot_available:
             self._append_bands_plot_point(self._last_bands)
+        self._write_event("bands", {"bands": dict(self._last_bands)})
 
     def _on_ble_failed(self, msg: str) -> None:
         self._status.setText(f"BLE ошибка: {msg}")
@@ -1549,8 +2609,19 @@ class MeditationMainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self._stats_timer.stop()
+        if self._obs_timer.isActive():
+            self._obs_timer.stop()
         if self._hr_plot_timer is not None:
             self._hr_plot_timer.stop()
+        if self._tone_plot_timer is not None:
+            self._tone_plot_timer.stop()
+        # Noise is independent from EEG→Tone; stop it explicitly.
+        if getattr(self, "_noise_enabled", False):
+            self._noise_enabled = False
+        try:
+            self._stop_noise_stream()
+        except Exception:
+            pass
         self._stop_eeg_tone()
         self._stop_eeg_binaural()
         if self._ble_scan_thread is not None and self._ble_scan_thread.isRunning():
@@ -1565,6 +2636,7 @@ class MeditationMainWindow(QMainWindow):
             self._api_server = None
         if self._session_log_file is not None:
             try:
+                self._write_session_end()
                 self._session_log_file.close()
             except OSError:
                 pass
@@ -1592,7 +2664,6 @@ class MeditationMainWindow(QMainWindow):
                 n += 1
             hz = n / 10.0
             parts.append(f"{hz:.1f} Hz")
-        self._hz_val.setText(f"{hz:.1f}" if hz is not None else "—")
 
         if self._last_hr_bpm is not None and self._last_hr_at is not None:
             age_hr = now - self._last_hr_at
@@ -1715,6 +2786,10 @@ class MeditationMainWindow(QMainWindow):
                         self._genmon_line.setText(
                             f"EEG→Tone(stereo) fL={self._eeg_tone_f_l:.1f}Hz fR={self._eeg_tone_f_r:.1f}Hz  vL={self._eeg_tone_v_l:.3f} vR={self._eeg_tone_v_r:.3f}"
                         )
+                        self._set_tone_base_text(
+                            f"stereo  fL={self._eeg_tone_f_l:.1f}Hz fR={self._eeg_tone_f_r:.1f}Hz  vL={self._eeg_tone_v_l:.3f} vR={self._eeg_tone_v_r:.3f}"
+                        )
+                        self._append_tone_plot_sample()
                 return
             self._eeg_tone_vol = self._eeg_tone_vol * (1.0 - self._eeg_tone_alpha)
             if self._eeg_tone_vol < 0.005:
@@ -1725,6 +2800,8 @@ class MeditationMainWindow(QMainWindow):
                     self._genmon_line.setText(
                         f"EEG→Tone(mono) v={self._eeg_tone_vol:.3f}"
                     )
+                    self._set_tone_base_text(f"mono  v={self._eeg_tone_vol:.3f}")
+                    self._append_tone_plot_sample()
             return
 
         # Map metrics.
@@ -1825,6 +2902,10 @@ class MeditationMainWindow(QMainWindow):
             self._genmon_line.setText(
                 f"EEG→Tone(stereo) fL={self._eeg_tone_f_l:.1f}Hz fR={self._eeg_tone_f_r:.1f}Hz  vL={self._eeg_tone_v_l:.3f} vR={self._eeg_tone_v_r:.3f}"
             )
+            self._set_tone_base_text(
+                f"stereo  fL={self._eeg_tone_f_l:.1f}Hz fR={self._eeg_tone_f_r:.1f}Hz  vL={self._eeg_tone_v_l:.3f} vR={self._eeg_tone_v_r:.3f}"
+            )
+            self._append_tone_plot_sample()
             return
 
         freq_src = med if self._eeg_tone_freq_src == "meditation" else att
@@ -1846,6 +2927,8 @@ class MeditationMainWindow(QMainWindow):
         self._genmon_line.setText(
             f"EEG→Tone(mono) f={self._eeg_tone_f_hz:.1f}Hz  v={self._eeg_tone_vol:.3f}"
         )
+        self._set_tone_base_text(f"mono  f={self._eeg_tone_f_hz:.1f}Hz  v={self._eeg_tone_vol:.3f}")
+        self._append_tone_plot_sample()
 
     def _apply_eeg_binaural(self) -> None:
         if not self._eeg_bin_enabled:
