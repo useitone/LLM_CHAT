@@ -4,6 +4,7 @@ PoC: meditation / concentration — phased hints, EEG from JSONL or live BLE, ag
 
 from __future__ import annotations
 
+import os
 import math
 import json
 import random
@@ -19,8 +20,10 @@ from io import TextIOBase
 from pathlib import Path
 from typing import Any, Iterator
 
-from PySide6.QtCore import QPointF, Qt, QTimer
-from PySide6.QtGui import QCloseEvent
+from html import escape as html_escape
+
+from PySide6.QtCore import QEvent, QObject, QPointF, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QCloseEvent, QKeyEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -38,6 +41,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSplitter,
     QTabWidget,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -48,6 +52,17 @@ except Exception:  # pragma: no cover - optional addon
     QChart = QChartView = QLineSeries = QValueAxis = None  # type: ignore[misc,assignment]
 
 from neurosync_pro.agent.server import start_agent_api, stop_agent_api
+from neurosync_pro.agent_runtime.chat_reply_parse import strip_md_json_fence, try_parse_ready_program_decision
+from neurosync_pro.agent_runtime.contracts import Decision, validate_and_normalize
+from neurosync_pro.agent_runtime.loop import (
+    SYSTEM_PROMPT as CHAT_STRUCTURED_SYSTEM_PROMPT,
+    RuntimeState,
+    apply_decision_policy,
+    commit_decision_state,
+    reset_llm_debounce,
+)
+from neurosync_pro.agent_runtime.spec_validate import validate_prog_spec, validate_timeline_body
+from neurosync_pro.agent_runtime.user_profile import load_ui_profile, resolved_profile_path, save_ui_profile
 from neurosync_pro.bus import EventBus
 from neurosync_pro.eeg.ble_stream import normalize_ble_address
 from neurosync_pro.ui.ble_thread import BleNotifyThread, BleScanThread
@@ -56,6 +71,136 @@ try:  # optional audio extras
 except Exception:  # pragma: no cover
     StreamConfig = None  # type: ignore[misc,assignment]
     ToneSweepStream = None  # type: ignore[misc,assignment]
+
+
+_LIAISON_REASON_CODES = frozenset(
+    {"greeting", "confirmation", "liaison", "check_in", "ping", "radio", "ack"}
+)
+_CHAT_LIAISON_FALLBACK_RU = (
+    "На связи, канал открыт. Готов к командам программатора "
+    "(JSON: set_spec, set_timeline, stop)."
+)
+
+
+def _chat_strip_context_prefix(full_user: str) -> str:
+    """Strip '[контекст интерфейса: …]\\n' prefix from the outgoing user line."""
+    s = (full_user or "").strip()
+    prefix = "[контекст интерфейса:"
+    if not s.startswith(prefix):
+        return s
+    bracket = s.find("]")
+    if bracket < 0:
+        return s
+    rest = s[bracket + 1 :].lstrip("\n").strip()
+    return rest if rest else s
+
+
+def _chat_is_liaison_ping(body: str) -> bool:
+    b = (body or "").lower()
+    if len(b) < 2:
+        return False
+    needles = (
+        "оператор",
+        "на связи",
+        "на связь",
+        "приём",
+        "прием",
+        "слышите",
+        "слышишь",
+        "алло",
+        "тест связи",
+        "вы здесь",
+        "вы тут",
+        "проверк",
+        "приём.",
+        "прием.",
+    )
+    return any(n in b for n in needles)
+
+
+CHAT_CAPABILITY_GROUNDING_RU = """
+Границы и честность (обязательно соблюдай):
+- Ты отвечаешь из чата. Звук по твоей команде меняется только после того, как оператор применил JSON («Применить команду» или автоприменение). Пока этого не было — не говори «я включил», «уже звучит», «активировал генератор»; говори «предлагаю команду ниже» / «если примените, будет …».
+- Через программатор доступны только действия в JSON: set_spec / set_timeline / stop (и hold без смены звука). Spec задаёт бинауральную составляющую (carrier+beat/amp), шум white|pink|brown/amp, sweep:…, off; таймлайн — по строкам mm:ss. Ты не переключаешь галочки EEG→тон, отдельный шум в другой панели, BLE и т.д. Если просят вне этого — прямо: «через этот чат только программатор; для … нужен элемент в интерфейсе».
+- Частоты и громкость формулируй как ориентир («примерно», «в рамках spec»), не как гарантию железа.
+- Не выдавай за реальность то, чего нет: нет прав — скажи, что не можешь; не придумывай «включение», если команда не прошла или не применена.
+""".strip()
+
+
+CHAT_FREE_FLIGHT_SYSTEM_PROMPT = (
+    """Ты со-пилот NeuroSync Pro: медитация, бинауральные биения, цветной шум, программатор звука.
+Отвечай по-русски живым языком — оператор хочет общения и общего направления.
+Можно образно и развёрнуто.
+
+"""
+    + CHAT_CAPABILITY_GROUNDING_RU
+    + """
+
+Если нужно реально изменить звук — в конце добавь РОВНО один fenced-блок ```json с одним JSON-объектом (без комментариев и текста внутри блока).
+Допустимые action: set_spec, set_timeline, stop, hold.
+
+КРИТИЧНО: поле spec — не описание словами и не английский псевдоязык. Только поддерживаемые токены (можно несколько через пробел в одной строке):
+- бинаураль: число+число/амплитуда   пример: 200+2/0.45  (несущая Гц + биение Гц / громкость 0..1)
+- шум: white ИЛИ pink ИЛИ brown с амплитудой   пример: brown/0.08
+- sweep: начало->конец/длительность_с/амплитуда   пример: sweep:200->120/45/0.5
+- выключить: off
+
+Примеры ВАЛИДНЫХ значений spec (копируй стиль, подставляй свои числа):
+  "200+6/0.50 pink/0.06"
+  "brown/0.10"
+  "sweep:180->90/60/0.45"
+  "off"
+
+ЗАПРЕЩЕНО в JSON внутри spec/timeline: фразы вида "brown noise", "binaural:2Hz delta", произвольный текст — это сломает проверку и команда не применится.
+Для таймлайна — строки вида 0:00 <spec> и 0:30 off (spec только из правил выше); в JSON можно одну строку с \\n или массив строк ["0:00 …", "0:30 …"] — оба формата поддерживаются.
+
+Не делай экстремальной громкости без запроса; если не уверен в цифрах — спроси словами и опусти JSON.
+
+Векторная память — позже; опирайся на переписку и метрики в сообщении пользователя.
+"""
+).strip()
+
+
+class _OllamaChatWorker(QThread):
+    finished_ok = Signal(str)
+    finished_err = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        messages: list[dict[str, str]],
+        timeout_s: float,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._base_url = base_url
+        self._model = model
+        self._messages = messages
+        self._timeout_s = timeout_s
+
+    def run(self) -> None:
+        try:
+            url = self._base_url.rstrip("/") + "/api/chat"
+            payload = {"model": self._model, "messages": self._messages, "stream": False}
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=self._timeout_s) as resp:
+                raw = resp.read().decode("utf-8")
+            data = json.loads(raw)
+            msg = data.get("message") if isinstance(data, dict) else None
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if not isinstance(content, str):
+                raise RuntimeError("Нет поля message.content в ответе Ollama")
+            self.finished_ok.emit(content)
+        except Exception as exc:
+            self.finished_err.emit(str(exc))
 
 
 def _iter_eeg(path: Path) -> Iterator[tuple[int, int]]:
@@ -202,6 +347,19 @@ class MeditationMainWindow(QMainWindow):
         self._prog_last_status_at = 0.0
         self._prog_status_min_s = 0.25
         self._prog_sink_url = ""
+
+        # Ollama chat (under Programmer): free-form vs structured JSON for program.set_spec.
+        self._chat_messages: list[dict[str, str]] = []
+        self._chat_last_decision: Decision | None = None
+        self._chat_worker: _OllamaChatWorker | None = None
+        self._chat_policy_state = RuntimeState()
+        self._chat_metric_loop_goal: str | None = None  # attention | meditation | am
+        self._chat_metric_loop_tick_index: int = 0
+        self._chat_metric_loop_timer = QTimer(self)
+        self._chat_metric_loop_timer.setSingleShot(False)
+        self._chat_metric_loop_interval_ms = self._chat_metric_loop_interval_ms_default()
+        self._chat_metric_loop_timer.setInterval(self._chat_metric_loop_interval_ms)
+        self._chat_metric_loop_timer.timeout.connect(self._chat_metric_loop_tick)
 
         # Generator monitor (UI-only; mirrors what we send to audio engine).
         self._genmon_text = ""
@@ -436,7 +594,148 @@ class MeditationMainWindow(QMainWindow):
 
         if not self._prog_available:
             self._prog_box.setToolTip("Установите audio extras: pip install -e \".[audio]\"")
+
+        self._chat_box = QGroupBox("Чат с моделью (Ollama)")
+        cb = QVBoxLayout(self._chat_box)
+        cb.setContentsMargins(8, 8, 8, 8)
+        cb.setSpacing(6)
+
+        chat_top = QWidget()
+        chat_top_lay = QHBoxLayout(chat_top)
+        chat_top_lay.setContentsMargins(0, 0, 0, 0)
+        chat_top_lay.addWidget(QLabel("Ollama URL"))
+        self._chat_base_url = QLineEdit()
+        self._chat_base_url.setText(os.environ.get("NSP_LOCAL_BASE_URL", "http://127.0.0.1:11434"))
+        chat_top_lay.addWidget(self._chat_base_url, 2)
+        chat_top_lay.addWidget(QLabel("Модель"))
+        self._chat_model = QLineEdit()
+        self._chat_model.setText(os.environ.get("NSP_LOCAL_MODEL", "deepseek-v3.1:671b-cloud"))
+        self._chat_model.setPlaceholderText("имя модели из ollama list")
+        chat_top_lay.addWidget(self._chat_model, 1)
+        cb.addWidget(chat_top)
+
+        mode_row = QWidget()
+        mode_lay = QHBoxLayout(mode_row)
+        mode_lay.setContentsMargins(0, 0, 0, 0)
+        self._chat_free_cb = QCheckBox("Свободное общение")
+        self._chat_free_cb.setChecked(True)
+        self._chat_free_cb.setToolTip(
+            "Включено: обычный диалог.\n"
+            "Выключено: режим промпта — ответ только JSON-команда программатора "
+            "(action set_spec / set_timeline / stop / hold), см. docs/specs/programmer_commands.md"
+        )
+        self._chat_free_cb.toggled.connect(self._chat_free_mode_changed)
+        mode_lay.addWidget(self._chat_free_cb)
+        self._chat_auto_apply_cb = QCheckBox("Автоприменение JSON")
+        self._chat_auto_apply_cb.setChecked(False)
+        self._chat_auto_apply_cb.setEnabled(False)
+        self._chat_auto_apply_cb.setToolTip(
+            "После ответа модели сразу выполнить распознанную команду (set_spec / set_timeline / stop), если она есть: "
+            "в режиме промпта (весь ответ — JSON) или в «Свободном полёте» (JSON в блоке ```json). "
+            "Ограничения agent_runtime — только если включены при режиме промпта."
+        )
+        mode_lay.addWidget(self._chat_auto_apply_cb)
+        self._chat_agent_runtime_policy_cb = QCheckBox("Ограничения как у agent_runtime")
+        self._chat_agent_runtime_policy_cb.setChecked(False)
+        self._chat_agent_runtime_policy_cb.setEnabled(False)
+        self._chat_agent_runtime_policy_cb.setToolTip(
+            "Выключено (по умолчанию): команда применяется сразу после проверки JSON — как в раннем PoC.\n"
+            "Включено: перед применением те же шаги, что у tools/agent_runtime.py "
+            "(debounce, cooldown, лимит частоты; переменные NSP_*)."
+        )
+        mode_lay.addWidget(self._chat_agent_runtime_policy_cb)
+        mode_lay.addStretch(1)
+        cb.addWidget(mode_row)
+
+        flight_row = QWidget()
+        flight_lay = QHBoxLayout(flight_row)
+        flight_lay.setContentsMargins(0, 0, 0, 0)
+        self._chat_freeflight_cb = QCheckBox("Свободный полёт")
+        self._chat_freeflight_cb.setChecked(False)
+        self._chat_freeflight_cb.setEnabled(False)
+        self._chat_freeflight_cb.setToolTip(
+            "Только при включённом «Свободном общении»: живой диалог по-русски и при желании команды программатора "
+            "в виде блока ```json в конце ответа. Можно включить «Автоприменение JSON», если команды должны "
+            "применяться сами после распознавания."
+        )
+        self._chat_freeflight_cb.toggled.connect(self._chat_freeflight_toggled)
+        flight_lay.addWidget(self._chat_freeflight_cb)
+        flight_lay.addStretch(1)
+        cb.addWidget(flight_row)
+
+        tpl_row = QWidget()
+        tpl_lay = QHBoxLayout(tpl_row)
+        tpl_lay.setContentsMargins(0, 0, 0, 0)
+        tpl_lay.addWidget(QLabel("Автотакт"))
+        btn_stop_tpl = QPushButton("Стоп")
+        btn_stop_tpl.setToolTip("Остановить автотакт метрик и подставить JSON stop в поле ввода.")
+        btn_stop_tpl.clicked.connect(self._chat_tpl_stop_clicked)
+        tpl_lay.addWidget(btn_stop_tpl)
+        for cap, goal, tip in (
+            (
+                "Attention",
+                "attention",
+                "Свободный полёт: как фраза «даю управление — влияйте на показатели», но запрос уходит сам каждые NSP_CHAT_METRIC_LOOP_S с; "
+                "модель может экспериментировать с JSON программатора, приоритет Attention.",
+            ),
+            (
+                "Meditation",
+                "meditation",
+                "То же для свободного полёта, приоритет Meditation.",
+            ),
+            (
+                "A/M",
+                "am",
+                "То же, фокус на балансе Attention/Meditation.",
+            ),
+        ):
+            tb = QPushButton(cap)
+            tb.setToolTip(tip)
+            tb.clicked.connect(lambda checked=False, g=goal: self._chat_start_metric_loop(g))
+            tpl_lay.addWidget(tb)
+        tpl_lay.addStretch(1)
+        cb.addWidget(tpl_row)
+
+        self._chat_view = QTextBrowser()
+        self._chat_view.setReadOnly(True)
+        self._chat_view.setMinimumHeight(120)
+        self._chat_view.setPlaceholderText("Здесь будет переписка…")
+        cb.addWidget(self._chat_view, 1)
+
+        self._chat_input = QPlainTextEdit()
+        self._chat_input.setPlaceholderText("Сообщение… (Enter — отправить, Shift+Enter — новая строка)")
+        self._chat_input.setFixedHeight(72)
+        self._chat_input.installEventFilter(self)
+        cb.addWidget(self._chat_input)
+
+        chat_btns = QWidget()
+        chat_btns_lay = QHBoxLayout(chat_btns)
+        chat_btns_lay.setContentsMargins(0, 0, 0, 0)
+        self._chat_send_btn = QPushButton("Отправить")
+        self._chat_send_btn.clicked.connect(self._chat_send_clicked)
+        self._chat_apply_btn = QPushButton("Применить команду")
+        self._chat_apply_btn.setEnabled(False)
+        self._chat_apply_btn.setToolTip(
+            "Применить последнюю распознанную команду (режим промпта или «Свободный полёт» с JSON в ответе). "
+            "Ограничения agent_runtime — только в режиме промпта и если включён соответствующий чекбокс."
+        )
+        self._chat_apply_btn.clicked.connect(self._chat_apply_clicked)
+        chat_btns_lay.addWidget(self._chat_send_btn)
+        chat_btns_lay.addWidget(self._chat_apply_btn)
+        chat_btns_lay.addStretch(1)
+        cb.addWidget(chat_btns)
+
+        self._chat_box.setToolTip(
+            "Настройки чата сохраняются при закрытии окна в JSON-профиль "
+            "(по умолчанию ~/.neurosync_pro/ui_profile.json или NSP_PROFILE_PATH).\n"
+            "По умолчанию JSON-команды применяются сразу после валидации. "
+            "«Свободный полёт»: диалог + опциональный ```json; контур agent_runtime к чату не подмешивается. "
+            "В режиме промпта ограничения debounce/cooldown/лимита — только если включён соответствующий чекбокс."
+        )
+        self._chat_load_profile()
+
         right_lay.addWidget(self._prog_box)
+        right_lay.addWidget(self._chat_box, 1)
         right_lay.addStretch(1)
 
         splitter.addWidget(left_scroll)
@@ -1206,6 +1505,442 @@ class MeditationMainWindow(QMainWindow):
     def _prog_sink_changed(self, text: str) -> None:
         self._prog_sink_url = str(text or "").strip()
 
+    def _chat_sync_auto_apply_enabled_state(self) -> None:
+        free = self._chat_free_cb.isChecked()
+        ff = free and self._chat_freeflight_cb.isChecked()
+        structured = not free
+        self._chat_auto_apply_cb.setEnabled(structured or ff)
+
+    def _chat_freeflight_toggled(self, checked: bool) -> None:
+        if not self._chat_free_cb.isChecked():
+            return
+        self._chat_sync_auto_apply_enabled_state()
+        if not checked:
+            self._chat_stop_metric_loop()
+            self._chat_auto_apply_cb.setChecked(False)
+            self._chat_apply_btn.setEnabled(False)
+
+    def _chat_free_mode_changed(self, checked: bool) -> None:
+        free = checked
+        structured = not free
+        self._chat_agent_runtime_policy_cb.setEnabled(structured)
+        self._chat_freeflight_cb.setEnabled(free)
+        if structured:
+            self._chat_stop_metric_loop()
+            self._chat_freeflight_cb.setChecked(False)
+        self._chat_sync_auto_apply_enabled_state()
+        if free:
+            if not self._chat_freeflight_cb.isChecked():
+                self._chat_auto_apply_cb.setChecked(False)
+            self._chat_apply_btn.setEnabled(False)
+            self._chat_last_decision = None
+
+    def _chat_cooldown_s(self) -> float:
+        raw = os.environ.get("NSP_COOLDOWN_S", "12")
+        try:
+            return max(0.0, float(str(raw).strip()))
+        except ValueError:
+            return 12.0
+
+    def _chat_command_ready(self, d: Decision) -> bool:
+        if d.action == "hold":
+            return False
+        if d.action == "stop":
+            return True
+        if not self._prog_available:
+            return False
+        if d.action == "set_spec" and bool(d.spec and str(d.spec).strip()):
+            return True
+        if d.action == "set_timeline" and bool(d.timeline and str(d.timeline).strip()):
+            return True
+        return False
+
+    def _chat_apply_decision(self, d: Decision) -> None:
+        structured_chat = not self._chat_free_cb.isChecked()
+        if structured_chat and self._chat_agent_runtime_policy_cb.isChecked():
+            filtered = apply_decision_policy(
+                d,
+                self._chat_policy_state,
+                mode="local",
+                cooldown_s=self._chat_cooldown_s(),
+            )
+            if filtered.action == "hold":
+                self._chat_append_html(
+                    "<span style='color:#fa0'><i>Не применено: "
+                    f"{html_escape(filtered.reason_code)} "
+                    "(политика как у agent_runtime: debounce → cooldown → rate_limit).</i></span>"
+                )
+                return
+        else:
+            filtered = d
+        if not self._chat_command_ready(filtered):
+            return
+        if filtered.action == "set_spec" and filtered.spec:
+            self._on_program_set_spec({"spec": filtered.spec})
+        elif filtered.action == "set_timeline" and filtered.timeline:
+            self._on_program_set_timeline({"timeline": filtered.timeline})
+        elif filtered.action == "stop":
+            self._prog_stop()
+        else:
+            return
+        commit_decision_state(filtered, self._chat_policy_state)
+
+    def _chat_metrics_hint(self) -> str:
+        parts: list[str] = []
+        if hasattr(self, "_att_val"):
+            parts.append(str(self._att_val.text()))
+        if hasattr(self, "_med_val"):
+            parts.append(str(self._med_val.text()))
+        if hasattr(self, "_hr_val"):
+            parts.append(str(self._hr_val.text()))
+        return " | ".join(p for p in parts if p.strip())
+
+    def _chat_tpl_insert(self, text: str) -> None:
+        if hasattr(self, "_chat_input"):
+            self._chat_input.setPlainText(text)
+            self._chat_input.setFocus()
+
+    def _chat_load_profile(self) -> None:
+        try:
+            data = load_ui_profile(resolved_profile_path())
+            url = str(data.get("ollama_base_url") or "").strip()
+            if url:
+                self._chat_base_url.setText(url)
+            model = str(data.get("ollama_model") or "").strip()
+            if model:
+                self._chat_model.setText(model)
+            self._chat_free_cb.setChecked(bool(data.get("chat_free_form", True)))
+            self._chat_freeflight_cb.setChecked(bool(data.get("chat_freeflight", False)))
+            self._chat_auto_apply_cb.setChecked(bool(data.get("chat_auto_apply", False)))
+            self._chat_agent_runtime_policy_cb.setChecked(
+                bool(data.get("chat_agent_runtime_policy", False))
+            )
+            self._chat_free_mode_changed(self._chat_free_cb.isChecked())
+        except Exception:
+            pass
+
+    def _chat_save_profile(self) -> None:
+        if not hasattr(self, "_chat_base_url"):
+            return
+        save_ui_profile(
+            {
+                "ollama_base_url": self._chat_base_url.text().strip(),
+                "ollama_model": self._chat_model.text().strip(),
+                "chat_free_form": self._chat_free_cb.isChecked(),
+                "chat_auto_apply": self._chat_auto_apply_cb.isChecked(),
+                "chat_agent_runtime_policy": self._chat_agent_runtime_policy_cb.isChecked(),
+                "chat_freeflight": self._chat_freeflight_cb.isChecked(),
+            },
+            resolved_profile_path(),
+        )
+
+    def _chat_metric_loop_interval_ms_default(self) -> int:
+        raw = os.environ.get("NSP_CHAT_METRIC_LOOP_S", "30")
+        try:
+            sec = float(str(raw).strip())
+        except ValueError:
+            sec = 30.0
+        sec = max(5.0, min(sec, 600.0))
+        return int(sec * 1000)
+
+    def _chat_build_system_prompt(self) -> str:
+        free = self._chat_free_cb.isChecked()
+        ff = free and self._chat_freeflight_cb.isChecked()
+        if free and ff:
+            return CHAT_FREE_FLIGHT_SYSTEM_PROMPT
+        if free:
+            return (
+                "Ты помощник в приложении NeuroSync Pro (медитация, бинауральные биения, цветной шум). "
+                "Отвечай по-русски, кратко и по делу.\n\n"
+                + CHAT_CAPABILITY_GROUNDING_RU
+            )
+        return (
+            CHAT_STRUCTURED_SYSTEM_PROMPT.strip()
+            + "\n\n"
+            + CHAT_CAPABILITY_GROUNDING_RU
+            + "\n\n"
+            + "Язык программатора (spec):\n"
+            + '- "<carrier>+<beat>/<amp>" (пример: "200+7/0.60")\n'
+            + '- "<color>/<amp>", где color=white|pink|brown (пример: "white/0.70")\n'
+            + '- "sweep:<f0>-><f1>/<dur>/<amp>" (пример: "sweep:1000->100/30/0.6")\n'
+            + '- "off"\n'
+            + "\n"
+            + "Тайминг: action set_timeline, поле timeline — одна строка с переносами \\n ИЛИ JSON-массив строк "
+            + "(каждая «mm:ss spec»). "
+            + "Пример белый шум 30 с:\n"
+            + '{"action":"set_timeline","timeline":"0:00 white/0.70\\n0:30 off","confidence":0.9,"reason_code":"user"}\n'
+            + 'Остановка: {"action":"stop","confidence":1,"reason_code":"user"}\n'
+            + "Проверка связи без смены программы — всё равно JSON с action hold, но обязательно добавь короткий текст в "
+            + 'assistant_reply по-русски, например: {"action":"hold","confidence":1,"reason_code":"liaison",'
+            + '"assistant_reply":"На связи, приём. Готов к командам set_spec / set_timeline / stop."}\n'
+            + "\n"
+            + "НЕ смешивай liaison с творческими задачами оператора:\n"
+            + "- «Оператор / на связи / приём» без запроса звука → hold + reason_code liaison + assistant_reply.\n"
+            + "- «Включите белый шум на N секунд» → только set_timeline: 0:00 white/… и 0:05 off для 5 с и т.п.\n"
+            + "- «Свободный полёт», «свободное управление», «пробуйте звуком повлиять», «настройте под медитацию» — это полномочие "
+            + "автономии: верни set_spec или короткий set_timeline по числам Attention/Meditation из контекста, "
+            + "reason_code operator_autopilot или creative_patch; короткий assistant_reply одним предложением что сделали. "
+            + "Не отвечай hold с отговоркой «нужна спецификация», если оператор сам разрешил свободу.\n"
+            + "Верни только JSON. Не используй псевдоформаты типа white_noise, duration=30s."
+        )
+
+    def _chat_full_user_from_body(self, user_text: str) -> str:
+        free = self._chat_free_cb.isChecked()
+        ff = free and self._chat_freeflight_cb.isChecked()
+        hint = self._chat_metrics_hint()
+        if hint and (not free or ff):
+            return f"[контекст интерфейса: {hint}]\n{user_text}"
+        return user_text
+
+    def _chat_dispatch_message(self, full_user: str) -> None:
+        if self._chat_worker is not None and self._chat_worker.isRunning():
+            return
+        text = (full_user or "").strip()
+        if not text:
+            return
+        base_url = self._chat_base_url.text().strip()
+        model = self._chat_model.text().strip()
+        if not base_url or not model:
+            self._chat_append_html("<span style='color:#f66'><b>Ошибка:</b> задайте Ollama URL и имя модели.</span>")
+            return
+
+        system_prompt = self._chat_build_system_prompt()
+        messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        messages.extend(self._chat_messages)
+        messages.append({"role": "user", "content": text})
+
+        timeout_s = float(os.environ.get("NSP_MODEL_TIMEOUT_S", "120"))
+
+        self._chat_pending_user = text
+        self._chat_append_html(f"<b>Вы:</b> {html_escape(text)}")
+        self._chat_send_btn.setEnabled(False)
+
+        self._chat_worker = _OllamaChatWorker(
+            base_url=base_url,
+            model=model,
+            messages=messages,
+            timeout_s=timeout_s,
+            parent=self,
+        )
+        self._chat_worker.finished_ok.connect(self._chat_on_reply_ok)
+        self._chat_worker.finished_err.connect(self._chat_on_reply_err)
+        self._chat_worker.finished.connect(self._chat_on_worker_finished)
+        self._chat_worker.start()
+
+    def _chat_metric_loop_body_for_goal(self, goal: str) -> str:
+        sec = max(self._chat_metric_loop_interval_ms, 1) / 1000.0
+        n = self._chat_metric_loop_tick_index
+        tact = "Первый такт цикла." if n <= 1 else f"Очередной такт цикла (сообщение №{n})."
+        mandate = (
+            f"{tact} Оператор передаёт управление, как в фразе: «хочу дать вам управление — попробуйте влиять на показатели»; "
+            f"это **автоматический опрос каждые ~{sec:g} с** только для режима свободного полёта. "
+            "Ты можешь **экспериментировать**: пробовать новые сочетания параметров в пределах языка программатора, смотреть на метрики и корректировать курс.\n"
+        )
+        rules = (
+            "Честность: не утверждай, что звук уже изменён, пока оператор не применил JSON (или автоприменение); "
+            "если предлагаешь правку — один блок ```json с валидным set_spec или set_timeline "
+            "(spec только допустимые токены; timeline одной строкой с \\n или JSON-массивом строк).\n"
+        )
+        if goal == "attention":
+            focus = (
+                "Приоритет эксперимента: **Attention** — подстраивай звук так, чтобы поддержать или мягко поднять внимание по числу Attention, "
+                "не жертвуя Meditation без нужды."
+            )
+        elif goal == "meditation":
+            focus = (
+                "Приоритет эксперимента: **Meditation** — подстраивай программу под показатель Meditation (глубина/стабильность), "
+                "избегая резких скачков."
+            )
+        else:
+            focus = (
+                "Приоритет эксперимента: **A/M** — ищи баланс Attention и Meditation; не дави на одну метрику ценой резкого обвала другой."
+            )
+        tail = (
+            "\nКратко: что видишь по цифрам по сравнению с прошлым ответом в этой сессии; "
+            "если хочешь сменить гипотезу — выдай команду программатора или коротко объясни, почему держишь hold без JSON."
+        )
+        return mandate + rules + focus + tail
+
+    def _chat_start_metric_loop(self, goal: str) -> None:
+        if not (self._chat_free_cb.isChecked() and self._chat_freeflight_cb.isChecked()):
+            self._chat_append_html(
+                "<span style='color:#fa0'><b>Автотакт:</b> включите «Свободное общение» и «Свободный полёт». "
+                "Для самого применения команд удобно также «Автоприменение JSON».</span>"
+            )
+            return
+        self._chat_metric_loop_goal = goal
+        self._chat_metric_loop_tick_index = 0
+        self._chat_metric_loop_interval_ms = self._chat_metric_loop_interval_ms_default()
+        self._chat_metric_loop_timer.setInterval(self._chat_metric_loop_interval_ms)
+        if not self._chat_metric_loop_timer.isActive():
+            self._chat_metric_loop_timer.start()
+        sec = self._chat_metric_loop_interval_ms / 1000.0
+        self._chat_append_html(
+            f"<span style='color:#8cf'><i>Свободный полёт: автотакт каждые {sec:g} с (эксперименты модели по метрикам), цель "
+            f"<b>{html_escape(goal)}</b>. Остановка — «Стоп». Интервал: <code>NSP_CHAT_METRIC_LOOP_S</code>.</i></span>"
+        )
+        self._chat_metric_loop_tick()
+
+    def _chat_stop_metric_loop(self) -> None:
+        self._chat_metric_loop_goal = None
+        self._chat_metric_loop_tick_index = 0
+        self._chat_metric_loop_timer.stop()
+
+    def _chat_metric_loop_tick(self) -> None:
+        if not self._chat_metric_loop_goal:
+            self._chat_metric_loop_timer.stop()
+            return
+        if self._chat_worker is not None and self._chat_worker.isRunning():
+            return
+        goal = self._chat_metric_loop_goal
+        assert goal is not None
+        self._chat_metric_loop_tick_index += 1
+        hint = self._chat_metrics_hint()
+        ctx = f"[контекст интерфейса: {hint}]\n" if hint else ""
+        body = self._chat_metric_loop_body_for_goal(goal)
+        full_user = ctx + body
+        self._chat_dispatch_message(full_user)
+
+    def _chat_tpl_stop_clicked(self) -> None:
+        self._chat_stop_metric_loop()
+        self._chat_tpl_insert('{"action":"stop","confidence":1,"reason_code":"tpl"}')
+
+    def _chat_send_clicked(self) -> None:
+        if self._chat_worker is not None and self._chat_worker.isRunning():
+            return
+        user_text = self._chat_input.toPlainText().strip()
+        if not user_text:
+            return
+        full_user = self._chat_full_user_from_body(user_text)
+        self._chat_dispatch_message(full_user)
+        self._chat_input.clear()
+
+    def _chat_append_html(self, html: str) -> None:
+        self._chat_view.append(html)
+        sb = self._chat_view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _chat_on_reply_ok(self, content: str) -> None:
+        self._chat_append_html(f"<b>Модель:</b> {html_escape(content)}")
+        u = str(getattr(self, "_chat_pending_user", "") or "")
+        if u:
+            self._chat_messages.append({"role": "user", "content": u})
+            self._chat_messages.append({"role": "assistant", "content": content})
+            while len(self._chat_messages) > 24:
+                self._chat_messages.pop(0)
+
+        free = self._chat_free_cb.isChecked()
+        self._chat_last_decision = None
+        if hasattr(self, "_chat_pending_user"):
+            del self._chat_pending_user
+
+        if free:
+            if self._chat_freeflight_cb.isChecked():
+                parsed_ff = try_parse_ready_program_decision(
+                    content,
+                    command_ready=self._chat_command_ready,
+                )
+                self._chat_last_decision = parsed_ff
+                can_ff = parsed_ff is not None
+                self._chat_apply_btn.setEnabled(can_ff)
+                if can_ff and not self._prog_available:
+                    self._chat_append_html(
+                        "<span style='color:#f66'><i>Программатор недоступен без аудио (extras). "
+                        "Команда в ответе есть, но не может быть применена.</i></span>"
+                    )
+                elif can_ff:
+                    self._chat_append_html(
+                        "<span style='color:#7b9'><i>Распознана команда программатора — «Применить команду» "
+                        "или включите автоприменение.</i></span>"
+                    )
+                elif "```" in content and not can_ff:
+                    self._chat_append_html(
+                        "<span style='color:#fa0'><i>В ответе есть блок ```…```, но команда не прошла проверку "
+                        "(часто модель вставляет описательный текст вместо языка spec). "
+                        "Нужны только токены: carrier+beat/amp, white|pink|brown/amp, sweep:…, off — см. подсказку режима "
+                        "«Свободный полёт» или docs/specs/programmer_commands.md.</i></span>"
+                    )
+                if self._chat_auto_apply_cb.isChecked() and can_ff and parsed_ff is not None:
+                    self._chat_apply_decision(parsed_ff)
+            else:
+                self._chat_apply_btn.setEnabled(False)
+            return
+
+        parsed = validate_and_normalize(strip_md_json_fence(content), source="chat_ui")
+        self._chat_last_decision = parsed
+        can_apply = self._chat_command_ready(parsed)
+        self._chat_apply_btn.setEnabled(can_apply)
+
+        if parsed.action == "hold":
+            reset_llm_debounce(self._chat_policy_state)
+            ar = (parsed.assistant_reply or "").strip()
+            body = _chat_strip_context_prefix(u)
+            rc_l = (parsed.reason_code or "").strip().lower()
+            liaison_ctx = _chat_is_liaison_ping(body) or rc_l in _LIAISON_REASON_CODES
+            used_ui_fallback = False
+            if not ar and liaison_ctx:
+                ar = _CHAT_LIAISON_FALLBACK_RU
+                used_ui_fallback = True
+            if ar:
+                self._chat_append_html(
+                    "<span style='color:#9cf'><b>Оператор:</b> "
+                    f"{html_escape(ar)}</span>"
+                )
+            if used_ui_fallback:
+                self._chat_append_html(
+                    "<span style='color:#777'><i>Программа без изменений (hold). "
+                    "Ниже — стандартное подтверждение связи в интерфейсе.</i></span>"
+                )
+            else:
+                self._chat_append_html(
+                    "<span style='color:#888'><i>Программа не менялась (hold"
+                    f"{', ' + html_escape(parsed.reason_code) if parsed.reason_code else ''}"
+                    "). Действия программатора: set_spec, set_timeline, stop.</i></span>"
+                )
+        elif parsed.action in ("set_spec", "set_timeline") and not self._prog_available:
+            self._chat_append_html(
+                "<span style='color:#f66'><i>Программатор недоступен без аудио (extras). "
+                "Команда распознана, но не может быть применена.</i></span>"
+            )
+        elif parsed.action == "stop" or can_apply:
+            pass
+        else:
+            self._chat_append_html(
+                "<span style='color:#aaa'><i>Команда неполная. Примеры spec: "
+                "200+7/0.60 | white/0.70 | sweep:1000->100/30/0.6 | off. "
+                "Для таймера: set_timeline с строками mm:ss spec.</i></span>"
+            )
+
+        if self._chat_auto_apply_cb.isChecked() and can_apply:
+            self._chat_apply_decision(parsed)
+
+    def _chat_on_reply_err(self, err: str) -> None:
+        self._chat_append_html(f"<span style='color:#f66'><b>Ollama:</b> {html_escape(err)}</span>")
+        if hasattr(self, "_chat_pending_user"):
+            del self._chat_pending_user
+
+    def _chat_on_worker_finished(self) -> None:
+        self._chat_send_btn.setEnabled(True)
+        if self._chat_worker is not None:
+            self._chat_worker.deleteLater()
+            self._chat_worker = None
+
+    def _chat_apply_clicked(self) -> None:
+        d = self._chat_last_decision
+        if d is None:
+            return
+        self._chat_apply_decision(d)
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
+        if hasattr(self, "_chat_input") and obj is self._chat_input and event.type() == QEvent.Type.KeyPress:
+            ke = event
+            if isinstance(ke, QKeyEvent) and ke.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                if ke.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    return False
+                self._chat_send_clicked()
+                return True
+        return super().eventFilter(obj, event)
+
     def _prog_run_clicked(self) -> None:
         if hasattr(self, "_prog_tabs") and int(self._prog_tabs.currentIndex()) == 1:
             self._prog_start_timeline(str(self._prog_tl_edit.toPlainText()))
@@ -1339,6 +2074,12 @@ class MeditationMainWindow(QMainWindow):
 
     def _prog_start(self, spec: str) -> None:
         self._prog_spec = str(spec or "").strip()
+        ok_spec, spec_reason = validate_prog_spec(self._prog_spec)
+        if not ok_spec:
+            self._status.setText(
+                f"Неверный spec ({spec_reason}). См. docs/specs/programmer_commands.md"
+            )
+            return
         parsed = self._prog_parse_spec(self._prog_spec)
         if parsed.get("off"):
             self._prog_stop()
@@ -1406,6 +2147,14 @@ class MeditationMainWindow(QMainWindow):
         self._prog_timers.clear()
 
     def _prog_start_timeline(self, text: str) -> None:
+        ok_tl, tl_reason = validate_timeline_body(text)
+        if not ok_tl:
+            self._status.setText(
+                f"Неверный timeline ({tl_reason}). См. docs/specs/programmer_commands.md"
+            )
+            self._prog_status_lbl.setText("timeline: ошибка разбора")
+            self._prog_timeline_running = False
+            return
         self._prog_clear_timers()
         self._prog_timeline_running = True
         items: list[tuple[float, str]] = []
@@ -2634,6 +3383,18 @@ class MeditationMainWindow(QMainWindow):
         if self._api_server is not None:
             stop_agent_api(self._api_server)
             self._api_server = None
+        if getattr(self, "_chat_metric_loop_timer", None) is not None and self._chat_metric_loop_timer.isActive():
+            self._chat_metric_loop_timer.stop()
+        self._chat_metric_loop_goal = None
+        if getattr(self, "_chat_worker", None) is not None:
+            if self._chat_worker.isRunning():
+                self._chat_worker.wait(5000)
+            self._chat_worker.deleteLater()
+            self._chat_worker = None
+        try:
+            self._chat_save_profile()
+        except OSError:
+            pass
         if self._session_log_file is not None:
             try:
                 self._write_session_end()
