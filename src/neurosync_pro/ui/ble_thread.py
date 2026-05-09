@@ -6,8 +6,11 @@ import asyncio
 
 from PySide6.QtCore import QThread, Signal
 
+import os
+
 from neurosync_pro.eeg.ble_stream import run_ble_notify_session, schedule_stop
 from neurosync_pro.eeg.live_decode import LiveEegDecoder
+from neurosync_pro.eeg.rr_extract import pick_rr_ms, rr_ms_to_bpm, try_extract_rr_ms_candidates
 from neurosync_pro.eeg.vendor_stream import Aabb0cHeartRateParser
 
 
@@ -18,6 +21,7 @@ class BleNotifyThread(QThread):
     signalQualityReady = Signal(int)
     bandsReady = Signal(int, int, int, int, int, int, int, int, int, int)
     heartRateReady = Signal(int)  # vendor HR (aabb0c, experimental)
+    extendRawReady = Signal(bytes)  # debug: raw extend payloads (opaque)
     connectionFailed = Signal(str)
     workerFinished = Signal()
 
@@ -48,26 +52,50 @@ class BleNotifyThread(QThread):
         self._stop_ev = asyncio.Event()
         decoder = LiveEegDecoder()
         hr_scan = Aabb0cHeartRateParser()
+        debug_extend = str(os.environ.get("NSP_HR_EXTEND_DEBUG", "0") or "0").strip() in {"1", "true", "yes", "on"}
 
         def on_chunk(data: bytes) -> None:
-            for frame in decoder.feed_chunk(data):
-                self.metricsReady.emit(frame.attention, frame.meditation)
-                if frame.signal_quality is not None:
-                    self.signalQualityReady.emit(int(frame.signal_quality))
-                self.bandsReady.emit(
-                    int(frame.delta),
-                    int(frame.theta),
-                    int(frame.low_alpha),
-                    int(frame.high_alpha),
-                    int(frame.low_beta),
-                    int(frame.high_beta),
-                    int(frame.low_gamma),
-                    int(frame.high_gamma),
-                    int(frame.attention),
-                    int(frame.meditation),
-                )
-            for bpm in hr_scan.feed(data):
-                self.heartRateReady.emit(int(bpm))
+            # Preferred path: state-machine extend_raw (firmware-aligned framing).
+            # Heuristic HR extraction from extend_raw is guarded by env until validated on real device.
+            use_extend_sm = str(os.environ.get("NSP_HR_EXTEND_SM", "0") or "0").strip() in {"1", "true", "yes", "on"}
+            found_extend_hr = False
+            for kind, payload in decoder.feed_chunk(data):
+                if kind == "eeg":
+                    frame = payload
+                    self.metricsReady.emit(frame.attention, frame.meditation)
+                    if frame.signal_quality is not None:
+                        self.signalQualityReady.emit(int(frame.signal_quality))
+                    self.bandsReady.emit(
+                        int(frame.delta),
+                        int(frame.theta),
+                        int(frame.low_alpha),
+                        int(frame.high_alpha),
+                        int(frame.low_beta),
+                        int(frame.high_beta),
+                        int(frame.low_gamma),
+                        int(frame.high_gamma),
+                        int(frame.attention),
+                        int(frame.meditation),
+                    )
+                elif kind == "extend_raw":
+                    raw = bytes(payload)
+                    if debug_extend:
+                        self.extendRawReady.emit(raw)
+                    if not use_extend_sm:
+                        continue
+                    raw = bytes(payload)
+                    # Prefer RR->BPM if we can extract plausible RR intervals.
+                    rrs = try_extract_rr_ms_candidates(raw)
+                    rr = pick_rr_ms(rrs)
+                    if rr is not None:
+                        bpm = int(round(rr_ms_to_bpm(float(rr))))
+                        if 40 <= bpm <= 200:
+                            found_extend_hr = True
+                            self.heartRateReady.emit(int(bpm))
+            # Fallback: vendor interleaved frames (noisy).
+            if not found_extend_hr:
+                for bpm in hr_scan.feed(data):
+                    self.heartRateReady.emit(int(bpm))
 
         try:
             self._loop.run_until_complete(

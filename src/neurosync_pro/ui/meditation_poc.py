@@ -18,7 +18,7 @@ from collections import deque
 from datetime import UTC, datetime
 from io import TextIOBase
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from html import escape as html_escape
 
@@ -64,8 +64,13 @@ from neurosync_pro.agent_runtime.loop import (
 from neurosync_pro.agent_runtime.spec_validate import validate_prog_spec, validate_timeline_body
 from neurosync_pro.agent_runtime.user_profile import load_ui_profile, resolved_profile_path, save_ui_profile
 from neurosync_pro.bus import EventBus
+from neurosync_pro.light.metrics_hook import try_attach_metrics_light_bridge
+from neurosync_pro.light.intent_sink import try_attach_light_intent_sink
 from neurosync_pro.eeg.ble_stream import normalize_ble_address
+from neurosync_pro.eeg.hr_filter import HrMedianSmoother
+from neurosync_pro.eeg.rr_extract import pick_rr_ms, rr_ms_to_bpm, try_extract_rr_ms_candidates
 from neurosync_pro.ui.ble_thread import BleNotifyThread, BleScanThread
+from neurosync_pro.ui.com_hr_thread import MacrotellectComHrThread
 try:  # optional audio extras
     from neurosync_pro.audio.stream import StreamConfig, ToneSweepStream
 except Exception:  # pragma: no cover
@@ -229,6 +234,9 @@ class MeditationMainWindow(QMainWindow):
         ble_address: str | None = None,
         ble_init_hex: str = "",
         ble_duration_s: float | None = None,
+        hr_source: str = "",
+        hr_com_port: str = "",
+        hr_pyd_dir: str = "",
         session_log_path: Path | None = None,
         auto_start_ble: bool = False,
         parent: QWidget | None = None,
@@ -236,12 +244,15 @@ class MeditationMainWindow(QMainWindow):
         super().__init__(parent)
         self.setWindowTitle("NeuroSync Pro — медитация / концентрация (PoC)")
         self._bus = EventBus()
+        self._light_bridge_detach: Callable[[], None] | None = None
+        self._light_send_detach: Callable[[], None] | None = None
         self._api_server = None
         self._ble_address = (ble_address or "").strip() or None
         self._ble_init_hex = ble_init_hex
         self._ble_duration_s = ble_duration_s
         self._ble_thread: BleNotifyThread | None = None
         self._ble_scan_thread: BleScanThread | None = None
+        self._hr_com_thread: MacrotellectComHrThread | None = None
         self._session_log_path = session_log_path
         self._session_log_file: TextIOBase | None = None
         self._session_log_active = session_log_path is not None
@@ -386,6 +397,30 @@ class MeditationMainWindow(QMainWindow):
         # Vendor HR (soft headband / aabb0c — experimental).
         self._last_hr_bpm: int | None = None
         self._last_hr_at: float | None = None
+        # Etalon HR diagnostics (COM thread).
+        self._last_etalon_event_at: float | None = None
+        self._etalon_rr_events: int = 0
+        self._etalon_extend_events: int = 0
+        self._etalon_errors: int = 0
+        self._etalon_last_error: str = ""
+        self._etalon_started_at: float | None = None
+        self._etalon_restart_delay_ms = self._etalon_restart_delay_ms_default()
+        env_hr_source = (os.environ.get("NSP_HR_SOURCE", "") or "").strip().lower()
+        self._hr_source = (hr_source or env_hr_source or "open").strip().lower()
+        self._hr_com_port = (hr_com_port or os.environ.get("NSP_HR_COM_PORT", "") or "COM3").strip()
+        self._hr_pyd_dir = (hr_pyd_dir or os.environ.get("NSP_HR_PYD_DIR", "") or "").strip()
+        # Defaults tuned for noisy vendor frames; can be adjusted via env.
+        self._hr_smoother = HrMedianSmoother(
+            window=int(os.environ.get("NSP_HR_SMOOTH_WINDOW", "5") or "5"),
+            max_delta_per_s=float(os.environ.get("NSP_HR_MAX_DELTA_PER_S", "12") or "12"),
+            jump_confirm=int(os.environ.get("NSP_HR_JUMP_CONFIRM", "2") or "2"),
+        )
+        # Separate smoother for etalon COM HR (more responsive by default).
+        self._hr_etalon_smoother = HrMedianSmoother(
+            window=int(os.environ.get("NSP_HR_ETALON_SMOOTH_WINDOW", "3") or "3"),
+            max_delta_per_s=float(os.environ.get("NSP_HR_ETALON_MAX_DELTA_PER_S", "60") or "60"),
+            jump_confirm=int(os.environ.get("NSP_HR_ETALON_JUMP_CONFIRM", "1") or "1"),
+        )
 
         # Simple rolling metrics plot (optional, requires PySide6.QtCharts).
         self._plot_available = QChart is not None
@@ -744,12 +779,17 @@ class MeditationMainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 2)
         splitter.setStretchFactor(2, 2)
+        # Live resize repaints QtCharts + QTextBrowser + nested layouts every pixel → laggy handle.
+        # Rubber-band resize keeps dragging smooth; panels apply size on mouse release.
+        splitter.setOpaqueResize(False)
+        splitter.setHandleWidth(7)
         # Center metrics: HR value sits next to its graph; EEG Hz only in the stats line above.
         self._hr_val = QLabel("—")
         self._hr_val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._hr_val.setToolTip(
             "Число BPM по vendor-кадрам AA BB 0C (экспериментально). Это не ЭКГ и не медицинский прибор; "
-            "без хвоста 23 23 после полезной нагрузки кадр отбрасывается."
+            "без хвоста 23 23 после полезной нагрузки кадр отбрасывается. "
+            "Отображаемое значение — медиана последних 5 кадров (для подавления одиночных выбросов)."
         )
         self._att_val = QLabel("Attention —")
         self._att_val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -772,6 +812,10 @@ class MeditationMainWindow(QMainWindow):
         self._bus.subscribe("program.set_spec", self._on_program_set_spec)
         self._bus.subscribe("program.set_timeline", self._on_program_set_timeline)
         self._bus.subscribe("program.stop", lambda _p: self._prog_stop())
+        # Optional EEG→light bridge (LedMatrix.md); off unless NSP_LIGHT_ENABLED=1.
+        self._light_bridge_detach = try_attach_metrics_light_bridge(self._bus)
+        # Optional light.intent → log/BLE sink; off unless NSP_LIGHT_SEND_ENABLED=1.
+        self._light_send_detach = try_attach_light_intent_sink(self._bus)
 
         self._plot_cb = QCheckBox("График (Attention / Meditation)")
         self._plot_cb.setEnabled(self._plot_available)
@@ -1105,11 +1149,33 @@ class MeditationMainWindow(QMainWindow):
         # Middle panel: HR block (above A/M — user-requested swap), then Attention/Meditation.
         self._hr_group = QGroupBox("Пульс (exp)")
         self._hr_group.setToolTip(
-            "Ориентир по vendor-кадрам, не ЭКГ. Пульс вынесем на эталон / CSE — панель пока вторична."
+            "Открытый HR — эвристика по BLE. Эталон — Macrotellect COM (RR/extend); при открытом COM многие гарнитуры "
+            "перестают слать EEG по BLE — тогда Attention/Meditation/Bands подпитываются из того же COM-потока "
+            "(NSP_HR_ETALON_FEED_EEG=1 по умолчанию)."
         )
         hr_block_lay = QVBoxLayout(self._hr_group)
         hr_block_lay.setContentsMargins(8, 4, 8, 4)
         hr_block_lay.setSpacing(4)
+
+        hr_src_row = QWidget()
+        hr_src_row_lay = QHBoxLayout(hr_src_row)
+        hr_src_row_lay.setContentsMargins(0, 0, 0, 0)
+        hr_src_row_lay.addWidget(QLabel("Источник:"))
+        self._hr_source_cb = QComboBox()
+        self._hr_source_cb.addItem("Открытый (BLE, exp)", userData="open")
+        self._hr_source_cb.addItem("Эталон (Macrotellect COM)", userData="etalon")
+        hr_src_row_lay.addWidget(self._hr_source_cb, 2)
+        hr_src_row_lay.addWidget(QLabel("COM:"))
+        self._hr_com_port_le = QLineEdit()
+        self._hr_com_port_le.setPlaceholderText("COM3")
+        hr_src_row_lay.addWidget(self._hr_com_port_le, 1)
+        self._hr_source_apply_btn = QPushButton("Применить")
+        self._hr_source_apply_btn.clicked.connect(self._apply_hr_source_ui)
+        hr_src_row_lay.addWidget(self._hr_source_apply_btn, 0)
+        hr_block_lay.addWidget(hr_src_row)
+        self._hr_etalon_status = QLabel("")
+        self._hr_etalon_status.setStyleSheet("color: palette(mid);")
+        hr_block_lay.addWidget(self._hr_etalon_status)
 
         hr_plot_row = QWidget()
         hr_plot_row_lay = QHBoxLayout(hr_plot_row)
@@ -1262,6 +1328,15 @@ class MeditationMainWindow(QMainWindow):
         left_lay.addWidget(self._api_cb)
         left_lay.addWidget(self._status)
         left_lay.addStretch(1)
+
+        # HR source UI initial state.
+        if getattr(self, "_hr_source", "open") == "etalon":
+            self._hr_source_cb.setCurrentIndex(1)
+        else:
+            self._hr_source_cb.setCurrentIndex(0)
+        self._hr_com_port_le.setText(self._hr_com_port or "COM3")
+        self._refresh_etalon_status()
+
         self.setCentralWidget(cw)
         self.resize(1180, 700)
 
@@ -1272,6 +1347,7 @@ class MeditationMainWindow(QMainWindow):
 
         if auto_start_ble and self._ble_address:
             QTimer.singleShot(300, self._start_ble)
+        QTimer.singleShot(400, self._maybe_start_etalon_hr)
         self._stats_timer.start()
 
     def _toggle_eeg_tone(self, on: bool) -> None:
@@ -1302,11 +1378,287 @@ class MeditationMainWindow(QMainWindow):
         self._stop_eeg_tone()
         if self._plot_available:
             self._clear_tone_plot()
-            self._apply_tone_plot_series_visibility()
-            if self._tone_plot_enabled:
-                self._refresh_tone_plot(force=True)
-        if hasattr(self, "_tone_vals_lbl"):
-            self._set_tone_base_text("—")
+
+    def _append_log(self, text: str) -> None:
+        # Lightweight UI log: use chat view (already scrollable) + stderr.
+        # Keep it robust: never raise from logging paths.
+        try:
+            msg = str(text)
+        except Exception:
+            msg = "<log>"
+        try:
+            if hasattr(self, "_chat_view"):
+                self._chat_append_html(f"<span style='color:#999'><i>{html_escape(msg)}</i></span>")
+        except Exception:
+            pass
+        try:
+            print(msg, file=sys.stderr)
+        except Exception:
+            pass
+
+    def _etalon_restart_delay_ms_default(self) -> int:
+        raw = os.environ.get("NSP_HR_COM_RESTART_DELAY_MS", "900")
+        try:
+            v = int(str(raw).strip())
+        except ValueError:
+            v = 900
+        return max(200, min(v, 8000))
+
+    def _etalon_com_stop_wait_s(self) -> float:
+        raw = os.environ.get("NSP_HR_COM_STOP_WAIT_S", "6")
+        try:
+            v = float(str(raw).strip())
+        except ValueError:
+            v = 6.0
+        return max(1.0, min(v, 30.0))
+
+    def _stop_etalon_com_thread_blocking(self) -> None:
+        """Stop COM HR reader and wait until the port is released (Windows COM quirk)."""
+        th = self._hr_com_thread
+        if th is None:
+            return
+        try:
+            th.request_stop()
+        except Exception:
+            pass
+        deadline = time.monotonic() + float(self._etalon_com_stop_wait_s())
+        while th.isRunning() and time.monotonic() < deadline:
+            try:
+                th.wait(150)
+            except Exception:
+                break
+        # Detach UI slots so stray signals never fire after restart.
+        for sig_name in (
+            "started",
+            "heartRateReady",
+            "metricsReady",
+            "signalQualityReady",
+            "bandsReady",
+            "debugEvent",
+            "connectionFailed",
+            "workerFinished",
+        ):
+            sig = getattr(th, sig_name, None)
+            if sig is None:
+                continue
+            try:
+                sig.disconnect()
+            except TypeError:
+                pass
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+        if self._hr_com_thread is th:
+            self._hr_com_thread = None
+
+    def _apply_hr_source_ui(self) -> None:
+        try:
+            mode = str(self._hr_source_cb.currentData() or "open").strip().lower()
+            self._hr_source = mode if mode in {"open", "etalon"} else "open"
+            self._hr_com_port = (self._hr_com_port_le.text() or "COM3").strip()
+            # Persist into env-style fields for logs/debug (no global os.environ mutation).
+            self._append_log(f"HR источник: {self._hr_source} (COM={self._hr_com_port})")
+            if self._hr_source == "etalon":
+                # Avoid showing stale value from open HR while waiting for COM to deliver first sample.
+                self._last_hr_bpm = None
+                self._last_hr_at = None
+                self._last_etalon_event_at = None
+                self._etalon_started_at = None
+                self._refresh_etalon_status()
+            self._maybe_start_etalon_hr(force_restart=True)
+        except Exception as exc:
+            # Never let UI handler crash: it can orphan running threads.
+            self._etalon_errors += 1
+            self._etalon_last_error = f"ui_apply_failed: {exc}"
+            try:
+                self._refresh_etalon_status()
+            except Exception:
+                pass
+            try:
+                self._append_log(f"HR UI ошибка: {exc}")
+            except Exception:
+                pass
+
+    def _maybe_start_etalon_hr(self, *, force_restart: bool = False) -> None:
+        want = getattr(self, "_hr_source", "open") == "etalon"
+        th = self._hr_com_thread
+        if th is not None and (force_restart or not want):
+            self._stop_etalon_com_thread_blocking()
+            self._refresh_etalon_status()
+            if want:
+                # Restart after delay so Windows releases COM handle (semaphore timeout otherwise).
+                delay_ms = int(self._etalon_restart_delay_ms)
+                QTimer.singleShot(delay_ms, lambda: self._maybe_start_etalon_hr(force_restart=False))
+                return
+
+        if not want or self._hr_com_thread is not None:
+            return
+
+        # Preflight checks to avoid "silent zeros" when the COM parser can't start.
+        pre_err = self._etalon_preflight_error()
+        if pre_err:
+            self._etalon_errors += 1
+            self._etalon_last_error = str(pre_err)
+            self._append_log(f"HR эталон (COM) не запущен: {pre_err}")
+            self._refresh_etalon_status()
+            return
+
+        th = MacrotellectComHrThread(
+            port=self._hr_com_port or "COM3",
+            pyd_dir=self._hr_pyd_dir or None,
+            parent=self,
+        )
+        qc = Qt.ConnectionType.QueuedConnection
+        th.started.connect(self._on_etalon_thread_started, qc)
+        th.heartRateReady.connect(self._on_etalon_hr, qc)
+        th.debugEvent.connect(self._on_etalon_hr_debug, qc)
+        th.connectionFailed.connect(self._on_etalon_hr_failed, qc)
+        th.workerFinished.connect(self._on_etalon_hr_finished, qc)
+        # BrainLink often stops BLE EEG while COM stream is active — reuse COM EEG for UI.
+        feed_com_eeg = str(os.environ.get("NSP_HR_ETALON_FEED_EEG", "1") or "1").strip().lower()
+        if feed_com_eeg not in {"0", "false", "no", "off"}:
+            th.metricsReady.connect(self._on_ble_metrics, qc)
+            th.signalQualityReady.connect(self._on_ble_signal_quality, qc)
+            th.bandsReady.connect(self._on_ble_bands, qc)
+        self._hr_com_thread = th
+        th.start()
+        self._refresh_etalon_status()
+        # If thread fails to start (or dies immediately), surface it quickly.
+        QTimer.singleShot(500, self._check_etalon_thread_alive)
+
+    def _on_etalon_hr_failed(self, msg: str) -> None:
+        self._etalon_errors += 1
+        self._etalon_last_error = str(msg)
+        self._append_log(f"HR эталон (COM) ошибка: {msg}")
+        self._refresh_etalon_status()
+
+    def _on_etalon_thread_started(self) -> None:
+        self._etalon_started_at = time.monotonic()
+        self._refresh_etalon_status()
+
+    def _on_etalon_hr_finished(self) -> None:
+        self._hr_com_thread = None
+        # User switched to open HR — normal shutdown, not an error.
+        if getattr(self, "_hr_source", "open") != "etalon":
+            self._refresh_etalon_status()
+            return
+        # If the thread stops immediately without events, surface it.
+        if self._last_etalon_event_at is None:
+            self._etalon_errors += 1
+            if not self._etalon_last_error:
+                self._etalon_last_error = "поток завершился без событий (порт/драйвер/pyD?)"
+        self._refresh_etalon_status()
+
+    def _check_etalon_thread_alive(self) -> None:
+        if getattr(self, "_hr_source", "open") != "etalon":
+            return
+        th = self._hr_com_thread
+        if th is None:
+            return
+        if not th.isRunning():
+            self._etalon_errors += 1
+            if not self._etalon_last_error:
+                self._etalon_last_error = "поток не запустился (см. лог, проверьте COM/pyD)"
+            self._refresh_etalon_status()
+
+    def _on_etalon_hr(self, bpm: int) -> None:
+        self._etalon_last_error = ""
+        self._last_etalon_event_at = time.monotonic()
+        self._refresh_etalon_status()
+        self._on_ble_heart_rate(int(bpm), source="macrotellect_com")
+
+    def _on_etalon_hr_debug(self, payload: dict) -> None:
+        # Optional diagnostics into session log (opt-in in com thread).
+        self._last_etalon_event_at = time.monotonic()
+        try:
+            k = str((payload or {}).get("kind") or "")
+            if k == "rr":
+                self._etalon_rr_events += 1
+            elif k == "extend":
+                self._etalon_extend_events += 1
+        except Exception:
+            pass
+        self._refresh_etalon_status()
+        try:
+            self._write_event("hr_etalon_debug", {"etalon": dict(payload or {})})
+        except Exception:
+            pass
+
+    def _refresh_etalon_status(self) -> None:
+        if not hasattr(self, "_hr_etalon_status"):
+            return
+        if getattr(self, "_hr_source", "open") != "etalon":
+            self._hr_etalon_status.setText("")
+            return
+        alive = self._hr_com_thread is not None and self._hr_com_thread.isRunning()
+        age = None
+        if self._last_etalon_event_at is not None:
+            age = max(0.0, time.monotonic() - float(self._last_etalon_event_at))
+        parts = []
+        parts.append("COM поток: " + ("OK" if alive else "нет"))
+        parts.append(f"rr={int(self._etalon_rr_events)}")
+        parts.append(f"extend={int(self._etalon_extend_events)}")
+        parts.append(f"errors={int(self._etalon_errors)}")
+        if self._etalon_started_at is None:
+            parts.append("started=—")
+        else:
+            parts.append(f"started={max(0.0, time.monotonic() - float(self._etalon_started_at)):.1f}s")
+        if age is None:
+            parts.append("last=—")
+        else:
+            parts.append(f"last={age:.1f}s")
+        if (self._etalon_last_error or "").strip():
+            parts.append(f"err={self._etalon_last_error}")
+        self._hr_etalon_status.setText(" | ".join(parts))
+
+    def _etalon_preflight_error(self) -> str | None:
+        # 1) pyserial import
+        try:
+            import serial  # type: ignore[import-not-found]
+        except Exception:
+            return "нет зависимости pyserial (установите: pip install -e . или pip install pyserial)"
+
+        # 2) BrainLinkParser.pyd presence (if pyd_dir is the default or explicitly set)
+        candidates: list[Path] = []
+        try:
+            if (self._hr_pyd_dir or "").strip():
+                candidates.append(Path(self._hr_pyd_dir))
+        except Exception:
+            pass
+        # Common case: run from repo root (cwd points at LLM_CHAT).
+        try:
+            candidates.append(Path.cwd() / "docs/specs/vendor/macrotellect_brainlink_parser")
+        except Exception:
+            pass
+        # Source tree layout: src/neurosync_pro/ui/meditation_poc.py → repo root is parents[3].
+        try:
+            candidates.append(Path(__file__).resolve().parents[3] / "docs/specs/vendor/macrotellect_brainlink_parser")
+        except Exception:
+            pass
+        # Installed layout fallback: if neurosync_pro lives under site-packages, parents[3] isn't repo.
+        # Try one more level up (harmless if it doesn't exist).
+        try:
+            candidates.append(Path(__file__).resolve().parents[4] / "docs/specs/vendor/macrotellect_brainlink_parser")
+        except Exception:
+            pass
+
+        tried: list[str] = []
+        for d in candidates:
+            d2 = d.expanduser()
+            tried.append(str(d2))
+            pyd_file = d2 / "BrainLinkParser.pyd"
+            if pyd_file.is_file():
+                break
+        else:
+            tried_s = "; ".join(tried) if tried else "<none>"
+            return (
+                "не найден BrainLinkParser.pyd. "
+                f"Проверили: {tried_s}. "
+                "Задайте NSP_HR_PYD_DIR или --hr-pyd-dir"
+            )
+
+        return None
 
     def _tone_l_freq_src_changed(self, _idx: int) -> None:
         data = self._tone_l_freq_src.currentData()
@@ -1642,6 +1994,14 @@ class MeditationMainWindow(QMainWindow):
             sec = 30.0
         sec = max(5.0, min(sec, 600.0))
         return int(sec * 1000)
+
+    def _hr_stale_s(self) -> float:
+        raw = os.environ.get("NSP_HR_STALE_S", "30")
+        try:
+            v = float(str(raw).strip())
+        except ValueError:
+            v = 30.0
+        return max(5.0, min(v, 600.0))
 
     def _chat_build_system_prompt(self) -> str:
         free = self._chat_free_cb.isChecked()
@@ -3126,8 +3486,8 @@ class MeditationMainWindow(QMainWindow):
             },
         )
 
-    def _append_hr_session_log(self, bpm: int) -> None:
-        self._write_event("hr", {"hr": {"bpm": int(bpm), "source": "aabb0c_exp"}})
+    def _append_hr_session_log(self, bpm: int, *, source: str = "aabb0c_exp") -> None:
+        self._write_event("hr", {"hr": {"bpm": int(bpm), "source": str(source)}})
 
     def _write_event(self, event_type: str, payload: dict[str, Any]) -> None:
         if not self._session_log_active:
@@ -3198,6 +3558,8 @@ class MeditationMainWindow(QMainWindow):
         self._last_metric_at = None
         self._last_hr_bpm = None
         self._last_hr_at = None
+        self._hr_smoother.reset()
+        self._hr_etalon_smoother.reset()
         self._hr_val.setText("—")
         if self._plot_available:
             self._clear_hr_plot()
@@ -3209,12 +3571,14 @@ class MeditationMainWindow(QMainWindow):
             duration_s=self._ble_duration_s,
             parent=self,
         )
-        th.metricsReady.connect(self._on_ble_metrics)
-        th.signalQualityReady.connect(self._on_ble_signal_quality)
-        th.bandsReady.connect(self._on_ble_bands)
-        th.heartRateReady.connect(self._on_ble_heart_rate)
-        th.connectionFailed.connect(self._on_ble_failed)
-        th.workerFinished.connect(self._on_ble_worker_finished)
+        qc_ble = Qt.ConnectionType.QueuedConnection
+        th.metricsReady.connect(self._on_ble_metrics, qc_ble)
+        th.signalQualityReady.connect(self._on_ble_signal_quality, qc_ble)
+        th.bandsReady.connect(self._on_ble_bands, qc_ble)
+        th.heartRateReady.connect(self._on_ble_heart_rate, qc_ble)
+        th.extendRawReady.connect(self._on_ble_extend_raw, qc_ble)
+        th.connectionFailed.connect(self._on_ble_failed, qc_ble)
+        th.workerFinished.connect(self._on_ble_worker_finished, qc_ble)
         self._ble_thread = th
         th.start()
         self._rssi_timer.start()
@@ -3259,12 +3623,43 @@ class MeditationMainWindow(QMainWindow):
         if self._status.text().startswith("BLE: подключение"):
             self._status.setText("BLE: поток активен")
 
-    def _on_ble_heart_rate(self, bpm: int) -> None:
-        self._last_hr_bpm = int(bpm)
-        self._last_hr_at = time.monotonic()
-        self._append_hr_plot_point(int(bpm))
-        self._bus.publish("vendor.heart_rate", {"bpm": int(bpm), "source": "aabb0c_exp"})
-        self._append_hr_session_log(int(bpm))
+    def _on_ble_heart_rate(self, bpm: int, *, source: str = "aabb0c_exp") -> None:
+        # If etalon HR is selected, ignore open (noisy) HR events.
+        if getattr(self, "_hr_source", "open") == "etalon" and source != "macrotellect_com":
+            return
+        now = time.monotonic()
+        # Etalon HR is expected to be less noisy; keep it responsive even if the
+        # open-HR smoother is configured aggressively.
+        if source == "macrotellect_com":
+            sm = self._hr_etalon_smoother.feed(int(bpm), t=now)
+        else:
+            sm = self._hr_smoother.feed(int(bpm), t=now)
+        if sm is None:
+            return
+        self._last_hr_bpm = int(sm)
+        self._last_hr_at = now
+        self._append_hr_plot_point(int(sm))
+        self._bus.publish("vendor.heart_rate", {"bpm": int(sm), "source": str(source)})
+        self._append_hr_session_log(int(sm), source=str(source))
+
+    def _on_ble_extend_raw(self, raw: bytes) -> None:
+        # Debug hook: log extend payloads + RR candidates for offline analysis.
+        try:
+            hx = bytes(raw).hex()
+        except Exception:
+            hx = ""
+        rrs = try_extract_rr_ms_candidates(bytes(raw))
+        rr = pick_rr_ms(rrs)
+        bpm = int(round(rr_ms_to_bpm(float(rr)))) if rr is not None else None
+        self._write_event(
+            "hr_extend_debug",
+            {
+                "extend_raw_hex": hx,
+                "rr_candidates_ms": [int(x) for x in rrs],
+                "rr_pick_ms": int(rr) if rr is not None else None,
+                "bpm_from_rr": int(bpm) if bpm is not None else None,
+            },
+        )
 
     def _on_ble_signal_quality(self, q: int) -> None:
         try:
@@ -3357,6 +3752,18 @@ class MeditationMainWindow(QMainWindow):
         self._apply_eeg_binaural()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        if self._light_send_detach is not None:
+            try:
+                self._light_send_detach()
+            except Exception:
+                pass
+            self._light_send_detach = None
+        if self._light_bridge_detach is not None:
+            try:
+                self._light_bridge_detach()
+            except Exception:
+                pass
+            self._light_bridge_detach = None
         self._stats_timer.stop()
         if self._obs_timer.isActive():
             self._obs_timer.stop()
@@ -3380,6 +3787,7 @@ class MeditationMainWindow(QMainWindow):
             self._ble_thread.request_stop()
             self._ble_thread.wait(8000)
             self._ble_thread = None
+        self._stop_etalon_com_thread_blocking()
         if self._api_server is not None:
             stop_agent_api(self._api_server)
             self._api_server = None
@@ -3428,12 +3836,13 @@ class MeditationMainWindow(QMainWindow):
 
         if self._last_hr_bpm is not None and self._last_hr_at is not None:
             age_hr = now - self._last_hr_at
-            if age_hr > 30.0:
+            if age_hr > self._hr_stale_s():
                 self._hr_val.setText(f"{self._last_hr_bpm} (нет обновл.)")
             else:
                 self._hr_val.setText(str(self._last_hr_bpm))
         else:
             self._hr_val.setText("—")
+        self._refresh_etalon_status()
 
         # Change rates over last 10 seconds (how often values change).
         if self._metrics_change_times:
@@ -3734,6 +4143,9 @@ def run_meditation_poc(
     ble_address: str | None = None,
     ble_init_hex: str = "",
     ble_duration_s: float | None = None,
+    hr_source: str = "",
+    hr_com_port: str = "",
+    hr_pyd_dir: str = "",
     session_log_path: Path | None = None,
     auto_start_ble: bool = False,
 ) -> int:
@@ -3743,6 +4155,9 @@ def run_meditation_poc(
         ble_address=ble_address,
         ble_init_hex=ble_init_hex,
         ble_duration_s=ble_duration_s,
+        hr_source=hr_source,
+        hr_com_port=hr_com_port,
+        hr_pyd_dir=hr_pyd_dir,
         session_log_path=session_log_path,
         auto_start_ble=auto_start_ble,
     )
