@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QScrollArea,
+    QSpinBox,
     QSplitter,
     QTabWidget,
     QTextBrowser,
@@ -812,10 +813,7 @@ class MeditationMainWindow(QMainWindow):
         self._bus.subscribe("program.set_spec", self._on_program_set_spec)
         self._bus.subscribe("program.set_timeline", self._on_program_set_timeline)
         self._bus.subscribe("program.stop", lambda _p: self._prog_stop())
-        # Optional EEG→light bridge (LedMatrix.md); off unless NSP_LIGHT_ENABLED=1.
-        self._light_bridge_detach = try_attach_metrics_light_bridge(self._bus)
-        # Optional light.intent → log/BLE sink; off unless NSP_LIGHT_SEND_ENABLED=1.
-        self._light_send_detach = try_attach_light_intent_sink(self._bus)
+        # Optional EEG→light bridges attached after «Свет» UI is built (_reattach_light_bridges).
 
         self._plot_cb = QCheckBox("График (Attention / Meditation)")
         self._plot_cb.setEnabled(self._plot_available)
@@ -1325,6 +1323,66 @@ class MeditationMainWindow(QMainWindow):
             bh.addWidget(self._ble_start)
             bh.addWidget(self._ble_stop)
             left_lay.addWidget(btn_row)
+
+        self._light_box = QGroupBox("Свет (матрица iPIXEL)")
+        self._light_box.setToolTip(
+            "Без ручного PowerShell: включите галочки и «Применить свет». "
+            "Значения синхронизируются с переменными NSP_LIGHT_* / NSP_LIGHT_BLE_* "
+            "и сохраняются в профиль при закрытии окна."
+        )
+        light_form = QFormLayout(self._light_box)
+        light_form.setContentsMargins(8, 4, 8, 4)
+        light_form.setSpacing(4)
+        self._light_enable_cb = QCheckBox("ЭЭГ → цвет (light.intent)")
+        self._light_mode_cb = QComboBox()
+        self._light_mode_cb.addItem("auto → RGB", userData="auto")
+        self._light_mode_cb.addItem("log (stderr)", userData="log")
+        self._light_send_cb = QCheckBox("Отправлять на матрицу")
+        self._light_send_mode_cb = QComboBox()
+        self._light_send_mode_cb.addItem("BLE", userData="ble")
+        self._light_send_mode_cb.addItem("log stderr", userData="log")
+        self._light_proto_cb = QComboBox()
+        self._light_proto_cb.addItem("ipixel_png", userData="ipixel_png")
+        self._light_proto_cb.addItem("raw (prefix+RGB)", userData="raw")
+        self._light_addr_le = QLineEdit()
+        self._light_addr_le.setPlaceholderText("MAC матрицы (напр. E6:F5:E2:0F:40:7F)")
+        self._light_w_spin = QSpinBox()
+        self._light_w_spin.setRange(1, 2048)
+        self._light_h_spin = QSpinBox()
+        self._light_h_spin.setRange(1, 2048)
+        self._light_brightness_spin = QSpinBox()
+        self._light_brightness_spin.setRange(1, 100)
+        self._light_dry_cb = QCheckBox("Только dry-run (без радиосвязи)")
+        self._light_ipx_init_cb = QCheckBox("При подключении: power + яркость")
+        self._light_apply_btn = QPushButton("Применить свет")
+        self._light_apply_btn.setToolTip(
+            "Переподписать мосты EEG→intent и intent→BLE без перезапуска приложения."
+        )
+        self._light_apply_btn.clicked.connect(self._light_apply_clicked)
+
+        light_form.addRow(self._light_enable_cb)
+        light_form.addRow("Режим метрик:", self._light_mode_cb)
+        light_form.addRow(self._light_send_cb)
+        light_form.addRow("Отправка intent:", self._light_send_mode_cb)
+        light_form.addRow("Протокол BLE:", self._light_proto_cb)
+        light_form.addRow("MAC матрицы:", self._light_addr_le)
+        _light_wh = QWidget()
+        _light_wh_lay = QHBoxLayout(_light_wh)
+        _light_wh_lay.setContentsMargins(0, 0, 0, 0)
+        _light_wh_lay.addWidget(QLabel("Ширина"))
+        _light_wh_lay.addWidget(self._light_w_spin)
+        _light_wh_lay.addWidget(QLabel("Высота"))
+        _light_wh_lay.addWidget(self._light_h_spin)
+        light_form.addRow("Размер заливки:", _light_wh)
+        light_form.addRow("Яркость (старт):", self._light_brightness_spin)
+        light_form.addRow(self._light_dry_cb)
+        light_form.addRow(self._light_ipx_init_cb)
+        light_form.addRow(self._light_apply_btn)
+
+        left_lay.addWidget(self._light_box)
+        self._light_fill_widgets_from_env_or_profile()
+        self._reattach_light_bridges()
+
         left_lay.addWidget(self._api_cb)
         left_lay.addWidget(self._status)
         left_lay.addStretch(1)
@@ -1974,17 +2032,128 @@ class MeditationMainWindow(QMainWindow):
     def _chat_save_profile(self) -> None:
         if not hasattr(self, "_chat_base_url"):
             return
-        save_ui_profile(
-            {
-                "ollama_base_url": self._chat_base_url.text().strip(),
-                "ollama_model": self._chat_model.text().strip(),
-                "chat_free_form": self._chat_free_cb.isChecked(),
-                "chat_auto_apply": self._chat_auto_apply_cb.isChecked(),
-                "chat_agent_runtime_policy": self._chat_agent_runtime_policy_cb.isChecked(),
-                "chat_freeflight": self._chat_freeflight_cb.isChecked(),
-            },
-            resolved_profile_path(),
+        payload: dict[str, Any] = {
+            "ollama_base_url": self._chat_base_url.text().strip(),
+            "ollama_model": self._chat_model.text().strip(),
+            "chat_free_form": self._chat_free_cb.isChecked(),
+            "chat_auto_apply": self._chat_auto_apply_cb.isChecked(),
+            "chat_agent_runtime_policy": self._chat_agent_runtime_policy_cb.isChecked(),
+            "chat_freeflight": self._chat_freeflight_cb.isChecked(),
+        }
+        if hasattr(self, "_light_enable_cb"):
+            payload.update(self._light_pack_profile())
+        save_ui_profile(payload, resolved_profile_path())
+
+    def _light_pack_profile(self) -> dict[str, Any]:
+        return {
+            "light_enabled": self._light_enable_cb.isChecked(),
+            "light_mode": str(self._light_mode_cb.currentData() or "auto"),
+            "light_send_enabled": self._light_send_cb.isChecked(),
+            "light_send_mode": str(self._light_send_mode_cb.currentData() or "ble"),
+            "light_ble_protocol": str(self._light_proto_cb.currentData() or "ipixel_png"),
+            "light_ble_address": self._light_addr_le.text().strip(),
+            "light_matrix_w": int(self._light_w_spin.value()),
+            "light_matrix_h": int(self._light_h_spin.value()),
+            "light_ble_brightness": int(self._light_brightness_spin.value()),
+            "light_ble_dry_run": self._light_dry_cb.isChecked(),
+            "light_ble_ipx_init": self._light_ipx_init_cb.isChecked(),
+        }
+
+    def _light_set_combo_by_data(self, combo: QComboBox, value: str) -> None:
+        v = (value or "").strip().lower()
+        for i in range(combo.count()):
+            d = combo.itemData(i)
+            if d is not None and str(d).strip().lower() == v:
+                combo.setCurrentIndex(i)
+                return
+
+    def _light_fill_widgets_from_env_or_profile(self) -> None:
+        prof = load_ui_profile(resolved_profile_path())
+
+        def _env_bool(key: str, pkey: str, default: bool) -> bool:
+            raw = os.environ.get(key)
+            if raw is not None and str(raw).strip() != "":
+                return str(raw).strip().lower() in ("1", "true", "yes", "on")
+            if pkey in prof:
+                return bool(prof.get(pkey))
+            return default
+
+        def _env_str(key: str, pkey: str, default: str = "") -> str:
+            raw = os.environ.get(key)
+            if raw is not None:
+                s = str(raw).strip()
+                if s != "":
+                    return s
+            v = prof.get(pkey)
+            if v is not None and str(v).strip() != "":
+                return str(v).strip()
+            return default
+
+        def _env_int(key: str, pkey: str, default: int) -> int:
+            raw = os.environ.get(key)
+            if raw is not None and str(raw).strip() != "":
+                try:
+                    return int(str(raw).strip(), 0)
+                except ValueError:
+                    pass
+            try:
+                return int(prof.get(pkey, default))
+            except (TypeError, ValueError):
+                return default
+
+        self._light_enable_cb.setChecked(_env_bool("NSP_LIGHT_ENABLED", "light_enabled", False))
+        self._light_set_combo_by_data(self._light_mode_cb, _env_str("NSP_LIGHT_MODE", "light_mode", "auto"))
+        self._light_send_cb.setChecked(_env_bool("NSP_LIGHT_SEND_ENABLED", "light_send_enabled", False))
+        self._light_set_combo_by_data(self._light_send_mode_cb, _env_str("NSP_LIGHT_SEND_MODE", "light_send_mode", "ble"))
+        self._light_set_combo_by_data(
+            self._light_proto_cb, _env_str("NSP_LIGHT_BLE_PROTOCOL", "light_ble_protocol", "ipixel_png")
         )
+        addr = _env_str("NSP_LIGHT_BLE_ADDRESS", "light_ble_address", "")
+        self._light_addr_le.setText(addr)
+        self._light_w_spin.setValue(_env_int("NSP_LIGHT_BLE_MATRIX_W", "light_matrix_w", 32))
+        self._light_h_spin.setValue(_env_int("NSP_LIGHT_BLE_MATRIX_H", "light_matrix_h", 16))
+        self._light_brightness_spin.setValue(_env_int("NSP_LIGHT_BLE_IPX_BRIGHTNESS", "light_ble_brightness", 80))
+        self._light_dry_cb.setChecked(_env_bool("NSP_LIGHT_BLE_DRY_RUN", "light_ble_dry_run", True))
+        self._light_ipx_init_cb.setChecked(_env_bool("NSP_LIGHT_BLE_IPX_INIT", "light_ble_ipx_init", True))
+
+    def _light_sync_env_from_widgets(self) -> None:
+        os.environ["NSP_LIGHT_ENABLED"] = "1" if self._light_enable_cb.isChecked() else "0"
+        os.environ["NSP_LIGHT_MODE"] = str(self._light_mode_cb.currentData() or "auto")
+        os.environ["NSP_LIGHT_SEND_ENABLED"] = "1" if self._light_send_cb.isChecked() else "0"
+        os.environ["NSP_LIGHT_SEND_MODE"] = str(self._light_send_mode_cb.currentData() or "ble")
+        os.environ["NSP_LIGHT_BLE_PROTOCOL"] = str(self._light_proto_cb.currentData() or "raw")
+        addr = self._light_addr_le.text().strip()
+        if addr:
+            os.environ["NSP_LIGHT_BLE_ADDRESS"] = normalize_ble_address(addr)
+        else:
+            os.environ["NSP_LIGHT_BLE_ADDRESS"] = ""
+        os.environ["NSP_LIGHT_BLE_MATRIX_W"] = str(int(self._light_w_spin.value()))
+        os.environ["NSP_LIGHT_BLE_MATRIX_H"] = str(int(self._light_h_spin.value()))
+        os.environ["NSP_LIGHT_BLE_IPX_BRIGHTNESS"] = str(int(self._light_brightness_spin.value()))
+        os.environ["NSP_LIGHT_BLE_DRY_RUN"] = "1" if self._light_dry_cb.isChecked() else "0"
+        os.environ["NSP_LIGHT_BLE_IPX_INIT"] = "1" if self._light_ipx_init_cb.isChecked() else "0"
+
+    def _reattach_light_bridges(self) -> None:
+        if getattr(self, "_light_send_detach", None) is not None:
+            try:
+                self._light_send_detach()
+            except Exception:
+                pass
+            self._light_send_detach = None
+        if getattr(self, "_light_bridge_detach", None) is not None:
+            try:
+                self._light_bridge_detach()
+            except Exception:
+                pass
+            self._light_bridge_detach = None
+        self._light_sync_env_from_widgets()
+        self._light_bridge_detach = try_attach_metrics_light_bridge(self._bus)
+        self._light_send_detach = try_attach_light_intent_sink(self._bus)
+
+    def _light_apply_clicked(self) -> None:
+        self._reattach_light_bridges()
+        if hasattr(self, "_status"):
+            self._status.setText("Свет: настройки применены")
 
     def _chat_metric_loop_interval_ms_default(self) -> int:
         raw = os.environ.get("NSP_CHAT_METRIC_LOOP_S", "30")

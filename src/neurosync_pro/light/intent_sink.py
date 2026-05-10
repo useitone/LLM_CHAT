@@ -2,6 +2,9 @@
 
 Disabled unless ``NSP_LIGHT_SEND_ENABLED=1``. BLE safe-by-default: ``NSP_LIGHT_BLE_DRY_RUN``
 defaults to true — set ``NSP_LIGHT_BLE_DRY_RUN=0`` only after UUID/prefix are validated.
+
+For iPIXEL matrices use ``NSP_LIGHT_BLE_PROTOCOL=ipixel_png`` (solid PNG transfer); optional
+``NSP_LIGHT_BLE_MATRIX_W`` / ``NSP_LIGHT_BLE_MATRIX_H`` (defaults 96×16).
 """
 
 from __future__ import annotations

@@ -61,6 +61,25 @@ def test_ble_worker_dry_run(capsys: pytest.CaptureFixture[str], monkeypatch: pyt
     assert "4, 5, 6" in err
 
 
+def test_ble_worker_ipixel_png_dry_run(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("NSP_LIGHT_BLE_PROTOCOL", "ipixel_png")
+    monkeypatch.setenv("NSP_LIGHT_BLE_DRY_RUN", "1")
+    monkeypatch.setenv("NSP_LIGHT_BLE_MATRIX_W", "16")
+    monkeypatch.setenv("NSP_LIGHT_BLE_MATRIX_H", "8")
+    w = BleSolidRgbWorker()
+    w.start()
+    try:
+        w.enqueue((40, 50, 60))
+        time.sleep(0.6)
+    finally:
+        w.stop()
+    err = capsys.readouterr().err
+    assert "ipixel_png" in err
+    assert "windows=" in err
+
+
 def test_sink_ble_mode_forwards_to_dry_worker(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
