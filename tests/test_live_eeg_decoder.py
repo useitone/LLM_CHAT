@@ -33,9 +33,11 @@ def test_live_decoder_single_packet() -> None:
     pkt = _make_eeg_packet_tlv(7, 9)
     frames = dec.feed_chunk(pkt)
     assert len(frames) == 1
-    assert frames[0].signal_quality == 0
-    assert frames[0].attention == 7
-    assert frames[0].meditation == 9
+    kind, frame = frames[0]
+    assert kind == "eeg"
+    assert frame.signal_quality == 0
+    assert frame.attention == 7
+    assert frame.meditation == 9
 
 
 def test_live_decoder_split_across_chunks() -> None:
@@ -45,6 +47,8 @@ def test_live_decoder_split_across_chunks() -> None:
     assert dec.feed_chunk(pkt[:mid]) == []
     frames = dec.feed_chunk(pkt[mid:])
     assert len(frames) == 1
-    assert frames[0].signal_quality == 0
-    assert frames[0].attention == 40
-    assert frames[0].meditation == 50
+    kind, frame = frames[0]
+    assert kind == "eeg"
+    assert frame.signal_quality == 0
+    assert frame.attention == 40
+    assert frame.meditation == 50

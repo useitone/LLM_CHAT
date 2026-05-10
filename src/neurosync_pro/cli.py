@@ -123,11 +123,18 @@ def cmd_meditation(args: argparse.Namespace) -> int:
         return 1
     raw = (args.ble_address or "").strip()
     ble_addr = normalize_ble_address(raw) if raw else ""
+    hr_pyd_dir = ""
+    if getattr(args, "hr_pyd_dir", None):
+        # argparse gives us a Path (WindowsPath). Normalize to string for UI layer.
+        hr_pyd_dir = str(args.hr_pyd_dir)
     return run_meditation_poc(
         jsonl_path=Path(args.input) if args.input else None,
         ble_address=ble_addr or None,
         ble_init_hex=(args.ble_init_hex or "").strip(),
         ble_duration_s=float(args.ble_duration) if args.ble_duration is not None else None,
+        hr_source=(args.hr_source or "").strip(),
+        hr_com_port=(args.hr_com_port or "").strip(),
+        hr_pyd_dir=hr_pyd_dir,
         session_log_path=Path(args.session_log) if args.session_log else None,
         auto_start_ble=bool(ble_addr),
     )
@@ -325,6 +332,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Append JSONL lines type=eeg (attention/meditation) during session.",
+    )
+    med.add_argument(
+        "--hr-source",
+        type=str,
+        default="",
+        help="HR source: open (BLE exp) | etalon (Macrotellect COM). Can also be set by NSP_HR_SOURCE.",
+    )
+    med.add_argument(
+        "--hr-com-port",
+        type=str,
+        default="",
+        help="COM port for etalon HR (default COM3, can also be set by NSP_HR_COM_PORT).",
+    )
+    med.add_argument(
+        "--hr-pyd-dir",
+        type=Path,
+        default="",
+        help="Directory with BrainLinkParser.pyd (can also be set by NSP_HR_PYD_DIR).",
     )
     med.set_defaults(func=cmd_meditation)
 

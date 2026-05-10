@@ -64,6 +64,26 @@ class ExtendFrameDecoded:
     heart_rate: int
 
 
+def extract_extend_frames(buf: bytes | bytearray) -> list[ExtendFrameDecoded]:
+    """Best-effort scan for fixed-length 15-byte extend frames inside a notify chunk."""
+    b = bytes(buf)
+    out: list[ExtendFrameDecoded] = []
+    i = 0
+    n = len(b)
+    sig = bytes([0xBB, 0x0C, 0x02])
+    while i + 15 <= n:
+        if b[i : i + 2] != HEADER:
+            i += 1
+            continue
+        if b[i + 2 : i + 5] == sig:
+            dec = decode_extend(b[i : i + 15])
+            if dec is not None:
+                out.append(dec)
+            i += 15
+            continue
+        i += 1
+    return out
+
 def decode_short(frame: bytes) -> ShortFrameDecoded:
     value = int.from_bytes(frame[5:7], "big", signed=True)
     b7 = frame[7]
@@ -288,7 +308,10 @@ class BrainLinkStateMachineParser:
             self.payload[self.offset] = b
             self.offset += 1
             if b == self.FLAG_CHECK_BYTE:
-                # extend decode skipped for now
+                # Emit raw extend payload for higher-level parsing.
+                # NOTE: format differs across firmwares; keep it opaque here.
+                raw = bytes(self.payload[: self.offset])
+                out.append(("extend_raw", raw))
                 self.state = ParserState.SYNC
 
         return out

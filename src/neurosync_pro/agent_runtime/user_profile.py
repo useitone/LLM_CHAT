@@ -33,6 +33,18 @@ def default_ui_profile_dict() -> dict[str, Any]:
         "chat_agent_runtime_policy": False,
         # «Свободный полёт»: живой диалог + опциональный JSON программатора из ответа.
         "chat_freeflight": False,
+        # PoC: EEG → LED matrix (optional; env NSP_LIGHT_* overrides profile when set).
+        "light_enabled": False,
+        "light_mode": "auto",
+        "light_send_enabled": False,
+        "light_send_mode": "ble",
+        "light_ble_protocol": "ipixel_png",
+        "light_ble_address": "",
+        "light_matrix_w": 32,
+        "light_matrix_h": 16,
+        "light_ble_brightness": 80,
+        "light_ble_dry_run": True,
+        "light_ble_ipx_init": True,
     }
 
 
