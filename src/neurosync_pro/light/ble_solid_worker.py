@@ -6,7 +6,20 @@ Modes (``NSP_LIGHT_BLE_PROTOCOL``):
 - ``ipixel_png`` — solid PNG sized to matrix WxH, framed like ``pypixelcolor`` ``send_image``
   (see ``ipixel_windows.py``). Default write UUID ``0000fa02-...`` if unset.
 
+For ``ipixel_png`` and real BLE (not dry-run), optional **notify + per-window ACK** on
+``0000fa03-...`` matches ``pypixelcolor`` behaviour (see ``ipixel_ack.py``). Disable with
+``NSP_LIGHT_BLE_IPX_WAIT_ACK=0`` if a firmware build does not notify.
+
 Safe default: ``NSP_LIGHT_BLE_DRY_RUN=1`` logs instead of writing.
+
+Optional **fade** (linear RGB between last target and new): ``NSP_LIGHT_BLE_FADE_MS`` > 0.
+Cap steps with ``NSP_LIGHT_BLE_FADE_MAX_STEPS``; optional floor between steps
+``NSP_LIGHT_BLE_FADE_MIN_STEP_S`` and ``NSP_LIGHT_BLE_FADE_RESPECT_MIN_INTERVAL`` (see docs).
+
+Optional **pulse** (brightness factor on last target until a new RGB is queued): ``NSP_LIGHT_BLE_PULSE_HZ`` > 0.
+
+On transfer failure (timeout, disconnect mid-frame, etc.), **full frame** is retried up to ``NSP_LIGHT_BLE_FRAME_RETRIES`` times with ``NSP_LIGHT_BLE_FRAME_RETRY_DELAY_S`` pause between attempts.
+Set ``NSP_LIGHT_BLE_RETRY_DEBUG=1`` for stderr lines on retry attempts / recovery.
 
 Requires ``bleak`` (already a project dependency).
 """
@@ -14,6 +27,7 @@ Requires ``bleak`` (already a project dependency).
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import queue
 import sys
@@ -21,7 +35,9 @@ import threading
 import time
 from typing import Any
 
-from neurosync_pro.light.ipixel_constants import IPixel_WRITE_UUID
+from neurosync_pro.light.ble_connect_retry import bleak_connect_with_retries
+from neurosync_pro.light.ipixel_ack import IpixelAckManager
+from neurosync_pro.light.ipixel_constants import IPixel_NOTIFY_UUID, IPixel_WRITE_UUID
 from neurosync_pro.light.ipixel_png import solid_rgb_png
 from neurosync_pro.light.ipixel_windows import build_png_transfer_windows
 
@@ -52,6 +68,30 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _fade_rgb_sequence(
+    src: tuple[int, int, int] | None,
+    dst: tuple[int, int, int],
+    fade_ms: float,
+    *,
+    max_steps: int = 32,
+) -> list[tuple[int, int, int]]:
+    """Linear RGB steps from ``src`` to ``dst``; single ``dst`` if no fade."""
+
+    if fade_ms <= 0 or src is None or src == dst:
+        return [dst]
+    cap = max(2, min(64, int(max_steps)))
+    steps = max(2, min(cap, int(fade_ms / 35.0)))
+    out: list[tuple[int, int, int]] = []
+    for i in range(1, steps + 1):
+        t = i / steps
+        out.append(
+            tuple(
+                max(0, min(255, int(round(src[j] * (1.0 - t) + dst[j] * t)))) for j in range(3)
+            )
+        )
+    return out
+
+
 class BleSolidRgbWorker:
     """One consumer thread with asyncio + optional persistent ``BleakClient``."""
 
@@ -60,8 +100,11 @@ class BleSolidRgbWorker:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._min_interval_s = max(0.02, min(0.5, _float_env("NSP_LIGHT_BLE_MIN_INTERVAL_S", 0.05)))
+        self._last_target_rgb: tuple[int, int, int] | None = None
 
     def start(self) -> None:
+        if self._thread is not None and not self._thread.is_alive():
+            self._thread = None
         if self._thread is not None:
             return
         self._stop.clear()
@@ -90,32 +133,258 @@ class BleSolidRgbWorker:
     def _thread_main(self) -> None:
         asyncio.run(self._async_main())
 
-    async def _send_ipixel_init(self, client: Any, wuuid: str) -> None:
+    async def _ipixel_stop_notify(self, client: Any, notify_uuid: str, started: bool) -> None:
+        if not started:
+            return
+        try:
+            await client.stop_notify(notify_uuid)
+        except Exception:
+            pass
+
+    async def _send_ipixel_init(
+        self,
+        client: Any,
+        wuuid: str,
+        *,
+        ack_mgr: IpixelAckManager | None,
+        notify_ok: bool,
+        wait_ack: bool,
+        ack_timeout: float,
+        chunk_response: bool,
+    ) -> None:
         if not _truthy(os.environ.get("NSP_LIGHT_BLE_IPX_INIT"), default=True):
             return
         blevel = _int_env("NSP_LIGHT_BLE_IPX_BRIGHTNESS", 80)
         blevel = max(1, min(100, blevel))
         power = bytes([5, 0, 7, 1, 1])
         bright = bytes([5, 0, 4, 0x80, blevel])
+        init_timeout = min(float(ack_timeout), 4.0)
         for pkt in (power, bright):
-            await client.write_gatt_char(wuuid, pkt, response=False)
-            await asyncio.sleep(0.05)
+            if ack_mgr is not None and notify_ok and wait_ack:
+                ack_mgr.reset()
+            await client.write_gatt_char(wuuid, pkt, response=chunk_response)
+            if ack_mgr is not None and notify_ok and wait_ack:
+                try:
+                    await asyncio.wait_for(ack_mgr.window_event.wait(), timeout=init_timeout)
+                except asyncio.TimeoutError:
+                    print("[light][ble] init ack timeout (continuing)", file=sys.stderr)
+            else:
+                await asyncio.sleep(0.05)
 
-    async def _write_chunks(
+    async def _write_ipixel_window(
         self,
         client: Any,
         wuuid: str,
-        payload: bytes,
+        window: bytes,
         *,
         chunk_size: int,
+        chunk_response: bool,
+        ack_mgr: IpixelAckManager | None,
+        notify_ok: bool,
+        wait_ack: bool,
+        ack_timeout: float,
     ) -> None:
         step = max(8, min(244, chunk_size))
-        for i in range(0, len(payload), step):
-            await client.write_gatt_char(wuuid, payload[i : i + step], response=False)
+        if ack_mgr is not None and wait_ack and notify_ok:
+            ack_mgr.reset()
+        for i in range(0, len(window), step):
+            await client.write_gatt_char(wuuid, window[i : i + step], response=chunk_response)
+        if ack_mgr is not None and wait_ack and notify_ok:
+            await asyncio.wait_for(ack_mgr.window_event.wait(), timeout=ack_timeout)
+        elif not (notify_ok and wait_ack):
+            await asyncio.sleep(0.02)
+
+    async def _run_ipixel_png(
+        self,
+        client: Any,
+        *,
+        addr: str,
+        wuuid: str,
+        notify_uuid: str,
+        rgb: tuple[int, int, int],
+        r0: int,
+        g0: int,
+        b0: int,
+        dry: bool,
+        connect_timeout: float,
+        chunk_size: int,
+        save_slot: int,
+    ) -> Any:
+        """Return possibly updated ``BleakClient``."""
+        mw = _int_env("NSP_LIGHT_BLE_MATRIX_W", 96)
+        mh = _int_env("NSP_LIGHT_BLE_MATRIX_H", 16)
+        png = solid_rgb_png(mw, mh, r0, g0, b0)
+        windows = build_png_transfer_windows(png, save_slot=save_slot)
+        if dry:
+            total = sum(len(w) for w in windows)
+            head = windows[0][:48].hex() if windows else ""
+            print(
+                f"[light][ble][dry_run][ipixel_png] rgb={rgb} "
+                f"windows={len(windows)} total_bytes={total} first48={head}",
+                file=sys.stderr,
+            )
+            return client
+
+        wait_ack = _truthy(os.environ.get("NSP_LIGHT_BLE_IPX_WAIT_ACK"), default=True)
+        chunk_response = _truthy(os.environ.get("NSP_LIGHT_BLE_WRITE_CHUNK_RESPONSE"), default=True)
+        ack_timeout = max(0.5, _float_env("NSP_LIGHT_BLE_ACK_TIMEOUT_S", 8.0))
+
+        if client is None or not client.is_connected:
+            client = await bleak_connect_with_retries(addr, connect_timeout)
+
+        ack_mgr: IpixelAckManager | None = None
+        notify_started = False
+        if wait_ack:
+            ack_mgr = IpixelAckManager()
+            try:
+                await client.start_notify(notify_uuid, ack_mgr.make_notify_handler())
+                notify_started = True
+            except Exception as exc:
+                print(f"[light][ble] start_notify failed, ACK wait disabled: {exc}", file=sys.stderr)
+                ack_mgr = None
+
+        notify_ok = notify_started and ack_mgr is not None
+
+        try:
+            await self._send_ipixel_init(
+                client,
+                wuuid,
+                ack_mgr=ack_mgr,
+                notify_ok=notify_ok,
+                wait_ack=wait_ack,
+                ack_timeout=ack_timeout,
+                chunk_response=chunk_response,
+            )
+            for win in windows:
+                await self._write_ipixel_window(
+                    client,
+                    wuuid,
+                    win,
+                    chunk_size=chunk_size,
+                    chunk_response=chunk_response,
+                    ack_mgr=ack_mgr,
+                    notify_ok=notify_ok,
+                    wait_ack=wait_ack,
+                    ack_timeout=ack_timeout,
+                )
+        finally:
+            await self._ipixel_stop_notify(client, notify_uuid, notify_started)
+
+        return client
+
+    async def _disconnect_ble_client(self, client: Any) -> None:
+        if client is None:
+            return
+        try:
+            if getattr(client, "is_connected", False):
+                await client.disconnect()
+        except Exception:
+            pass
+
+    async def _run_ipixel_png_with_frame_retries(
+        self,
+        client: Any,
+        *,
+        addr: str,
+        wuuid: str,
+        notify_uuid: str,
+        rgb: tuple[int, int, int],
+        r0: int,
+        g0: int,
+        b0: int,
+        dry: bool,
+        connect_timeout: float,
+        chunk_size: int,
+        save_slot: int,
+    ) -> Any:
+        retries = max(1, _int_env("NSP_LIGHT_BLE_FRAME_RETRIES", 2))
+        delay = max(0.0, _float_env("NSP_LIGHT_BLE_FRAME_RETRY_DELAY_S", 0.15))
+        last_exc: Exception | None = None
+        cur = client
+        retry_dbg = _truthy(os.environ.get("NSP_LIGHT_BLE_RETRY_DEBUG"), default=False)
+        for attempt in range(retries):
+            try:
+                out = await self._run_ipixel_png(
+                    cur,
+                    addr=addr,
+                    wuuid=wuuid,
+                    notify_uuid=notify_uuid,
+                    rgb=rgb,
+                    r0=r0,
+                    g0=g0,
+                    b0=b0,
+                    dry=dry,
+                    connect_timeout=connect_timeout,
+                    chunk_size=chunk_size,
+                    save_slot=save_slot,
+                )
+                if attempt > 0 and retry_dbg:
+                    print(
+                        f"[light][ble] frame ok after {attempt + 1} attempt(s) rgb={rgb} ipixel_png",
+                        file=sys.stderr,
+                    )
+                return out
+            except Exception as exc:
+                last_exc = exc
+                if retry_dbg:
+                    print(
+                        f"[light][ble] frame attempt {attempt + 1}/{retries} failed rgb={rgb}: {exc!r}",
+                        file=sys.stderr,
+                    )
+                await self._disconnect_ble_client(cur)
+                cur = None
+                if attempt + 1 < retries and delay > 0:
+                    await asyncio.sleep(delay)
+        if last_exc is not None:
+            raise last_exc
+        return cur
+
+    async def _send_raw_payload_with_frame_retries(
+        self,
+        client: Any,
+        *,
+        addr: str,
+        wuuid: str,
+        payload: bytes,
+        dry: bool,
+        connect_timeout: float,
+    ) -> Any:
+        if dry:
+            return client
+        retries = max(1, _int_env("NSP_LIGHT_BLE_FRAME_RETRIES", 2))
+        delay = max(0.0, _float_env("NSP_LIGHT_BLE_FRAME_RETRY_DELAY_S", 0.15))
+        last_exc: Exception | None = None
+        cur = client
+        retry_dbg = _truthy(os.environ.get("NSP_LIGHT_BLE_RETRY_DEBUG"), default=False)
+        for attempt in range(retries):
+            try:
+                if cur is None or not getattr(cur, "is_connected", False):
+                    cur = await bleak_connect_with_retries(addr, connect_timeout)
+                await cur.write_gatt_char(wuuid, payload, response=False)
+                if attempt > 0 and retry_dbg:
+                    print(
+                        f"[light][ble] frame ok after {attempt + 1} attempt(s) raw payload_len={len(payload)}",
+                        file=sys.stderr,
+                    )
+                return cur
+            except Exception as exc:
+                last_exc = exc
+                if retry_dbg:
+                    print(
+                        f"[light][ble] frame attempt {attempt + 1}/{retries} failed raw: {exc!r}",
+                        file=sys.stderr,
+                    )
+                await self._disconnect_ble_client(cur)
+                cur = None
+                if attempt + 1 < retries and delay > 0:
+                    await asyncio.sleep(delay)
+        if last_exc is not None:
+            raise last_exc
+        return cur
 
     async def _async_main(self) -> None:
         try:
-            from bleak import BleakClient
+            import bleak  # noqa: F401
         except ImportError:
             print("[light][ble] bleak is not installed", file=sys.stderr)
             return
@@ -126,6 +395,7 @@ class BleSolidRgbWorker:
         wuuid = (os.environ.get("NSP_LIGHT_BLE_WRITE_UUID") or "").strip()
         if proto == "ipixel_png" and not wuuid:
             wuuid = IPixel_WRITE_UUID
+        notify_uuid = (os.environ.get("NSP_LIGHT_BLE_NOTIFY_UUID") or "").strip() or IPixel_NOTIFY_UUID
         prefix_hex = (os.environ.get("NSP_LIGHT_BLE_RGB_PREFIX_HEX") or "").strip().replace(" ", "")
         connect_timeout = max(2.0, _float_env("NSP_LIGHT_BLE_CONNECT_TIMEOUT", 8.0))
         chunk_size = _int_env("NSP_LIGHT_BLE_WRITE_CHUNK", 244)
@@ -147,7 +417,6 @@ class BleSolidRgbWorker:
 
         client: Any = None
         next_ok = 0.0
-        sent_ipixel_init = False
 
         def _get_rgb() -> tuple[int, int, int] | None:
             try:
@@ -155,8 +424,12 @@ class BleSolidRgbWorker:
             except queue.Empty:
                 return None
 
+        pending_rgb: tuple[int, int, int] | None = None
         while not self._stop.is_set():
-            rgb = await asyncio.to_thread(_get_rgb)
+            rgb = pending_rgb
+            pending_rgb = None
+            if rgb is None:
+                rgb = await asyncio.to_thread(_get_rgb)
             if rgb is None:
                 continue
 
@@ -167,63 +440,146 @@ class BleSolidRgbWorker:
 
             r, g, b = rgb
             r0, g0, b0 = max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b))
-
-            if proto == "ipixel_png":
-                mw = _int_env("NSP_LIGHT_BLE_MATRIX_W", 96)
-                mh = _int_env("NSP_LIGHT_BLE_MATRIX_H", 16)
-                png = solid_rgb_png(mw, mh, r0, g0, b0)
-                windows = build_png_transfer_windows(png, save_slot=save_slot)
-                if dry:
-                    total = sum(len(w) for w in windows)
-                    head = windows[0][:48].hex() if windows else ""
-                    print(
-                        f"[light][ble][dry_run][ipixel_png] rgb={rgb} "
-                        f"windows={len(windows)} total_bytes={total} first48={head}",
-                        file=sys.stderr,
-                    )
-                    continue
-
-                try:
-                    if client is None or not client.is_connected:
-                        client = BleakClient(addr, timeout=connect_timeout)
-                        await client.connect()
-                        sent_ipixel_init = False
-                    if not sent_ipixel_init:
-                        await self._send_ipixel_init(client, wuuid)
-                        sent_ipixel_init = True
-                    for win in windows:
-                        await self._write_chunks(client, wuuid, win, chunk_size=chunk_size)
-                        await asyncio.sleep(0.02)
-                except Exception as exc:
-                    print(f"[light][ble] ipixel_png failed: {exc}", file=sys.stderr)
-                    if client is not None:
-                        try:
-                            await client.disconnect()
-                        except Exception:
-                            pass
-                        client = None
-                        sent_ipixel_init = False
-                continue
-
-            # --- raw protocol ---
-            payload = prefix + bytes((r0, g0, b0))
-            if dry:
-                print(f"[light][ble][dry_run] rgb={rgb} payload={payload.hex()}", file=sys.stderr)
-                continue
+            target = (r0, g0, b0)
+            fade_ms = max(0.0, _float_env("NSP_LIGHT_BLE_FADE_MS", 0.0))
+            fade_max_steps = max(2, min(64, _int_env("NSP_LIGHT_BLE_FADE_MAX_STEPS", 32)))
+            fade_seq = _fade_rgb_sequence(
+                self._last_target_rgb, target, fade_ms, max_steps=fade_max_steps
+            )
+            post_sleep = (
+                (fade_ms / 1000.0 / max(len(fade_seq), 1)) if fade_ms > 0 and len(fade_seq) > 1 else 0.0
+            )
+            fade_floor_s = max(0.0, _float_env("NSP_LIGHT_BLE_FADE_MIN_STEP_S", 0.0))
+            fade_respect_min_iv = _truthy(
+                os.environ.get("NSP_LIGHT_BLE_FADE_RESPECT_MIN_INTERVAL"), default=False
+            )
 
             try:
-                if client is None or not client.is_connected:
-                    client = BleakClient(addr, timeout=connect_timeout)
-                    await client.connect()
-                await client.write_gatt_char(wuuid, payload, response=False)
+                if proto == "ipixel_png":
+                    for i, (sr, sg, sb) in enumerate(fade_seq):
+                        if self._stop.is_set():
+                            break
+                        client = await self._run_ipixel_png_with_frame_retries(
+                            client,
+                            addr=addr,
+                            wuuid=wuuid,
+                            notify_uuid=notify_uuid,
+                            rgb=(sr, sg, sb),
+                            r0=sr,
+                            g0=sg,
+                            b0=sb,
+                            dry=dry,
+                            connect_timeout=connect_timeout,
+                            chunk_size=chunk_size,
+                            save_slot=save_slot,
+                        )
+                        if i + 1 < len(fade_seq):
+                            gap = post_sleep
+                            if fade_floor_s > 0:
+                                gap = max(gap, fade_floor_s)
+                            if fade_respect_min_iv:
+                                gap = max(gap, self._min_interval_s)
+                            if gap > 0:
+                                await asyncio.sleep(gap)
+                else:
+                    for i, (sr, sg, sb) in enumerate(fade_seq):
+                        if self._stop.is_set():
+                            break
+                        payload = prefix + bytes((sr, sg, sb))
+                        if dry:
+                            print(
+                                f"[light][ble][dry_run] rgb={(sr, sg, sb)} payload={payload.hex()}",
+                                file=sys.stderr,
+                            )
+                        else:
+                            client = await self._send_raw_payload_with_frame_retries(
+                                client,
+                                addr=addr,
+                                wuuid=wuuid,
+                                payload=payload,
+                                dry=dry,
+                                connect_timeout=connect_timeout,
+                            )
+                        if i + 1 < len(fade_seq):
+                            gap = post_sleep
+                            if fade_floor_s > 0:
+                                gap = max(gap, fade_floor_s)
+                            if fade_respect_min_iv:
+                                gap = max(gap, self._min_interval_s)
+                            if gap > 0:
+                                await asyncio.sleep(gap)
             except Exception as exc:
-                print(f"[light][ble] write/connect failed: {exc}", file=sys.stderr)
-                if client is not None:
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
+                if proto == "ipixel_png":
+                    print(f"[light][ble] ipixel_png failed: {exc}", file=sys.stderr)
+                else:
+                    print(f"[light][ble] write/connect failed: {exc}", file=sys.stderr)
+                await self._disconnect_ble_client(client)
+                client = None
+                continue
+
+            if self._stop.is_set():
+                continue
+            self._last_target_rgb = target
+
+            pulse_hz = _float_env("NSP_LIGHT_BLE_PULSE_HZ", 0.0)
+            if pulse_hz <= 0:
+                continue
+
+            period = 1.0 / max(0.05, min(pulse_hz, 25.0))
+            step_sleep = max(self._min_interval_s * 0.4, min(0.18, period / 14.0))
+            t0 = time.monotonic()
+            while not self._stop.is_set():
+                try:
+                    pending_rgb = self._q.get_nowait()
+                    break
+                except queue.Empty:
+                    pass
+                ph = (time.monotonic() - t0) * (2 * math.pi / period)
+                fac = 0.25 + 0.75 * (0.5 + 0.5 * math.sin(ph))
+                pr = max(0, min(255, int(round(r0 * fac))))
+                pg = max(0, min(255, int(round(g0 * fac))))
+                pb = max(0, min(255, int(round(b0 * fac))))
+                try:
+                    if proto == "ipixel_png":
+                        client = await self._run_ipixel_png_with_frame_retries(
+                            client,
+                            addr=addr,
+                            wuuid=wuuid,
+                            notify_uuid=notify_uuid,
+                            rgb=(pr, pg, pb),
+                            r0=pr,
+                            g0=pg,
+                            b0=pb,
+                            dry=dry,
+                            connect_timeout=connect_timeout,
+                            chunk_size=chunk_size,
+                            save_slot=save_slot,
+                        )
+                    else:
+                        payload = prefix + bytes((pr, pg, pb))
+                        if dry:
+                            print(
+                                f"[light][ble][dry_run] rgb={(pr, pg, pb)} payload={payload.hex()}",
+                                file=sys.stderr,
+                            )
+                        else:
+                            client = await self._send_raw_payload_with_frame_retries(
+                                client,
+                                addr=addr,
+                                wuuid=wuuid,
+                                payload=payload,
+                                dry=dry,
+                                connect_timeout=connect_timeout,
+                            )
+                except Exception as exc:
+                    if proto == "ipixel_png":
+                        print(f"[light][ble] ipixel_png failed: {exc}", file=sys.stderr)
+                    else:
+                        print(f"[light][ble] write/connect failed: {exc}", file=sys.stderr)
+                    await self._disconnect_ble_client(client)
                     client = None
+                    break
+                await asyncio.sleep(step_sleep)
 
         if client is not None and not dry:
             try:

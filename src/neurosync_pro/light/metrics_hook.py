@@ -18,6 +18,8 @@ from typing import Any, Callable
 
 from neurosync_pro.bus import EventBus
 
+from neurosync_pro.light.auto_rules import get_auto_rules_from_env, rgb_from_auto_rules
+
 
 def _truthy(raw: str | None, *, default: bool = False) -> bool:
     if raw is None or str(raw).strip() == "":
@@ -83,6 +85,8 @@ class MetricsLightBridge:
             return
 
         if self._mode == "auto":
+            if _truthy(os.environ.get("NSP_LIGHT_SKIP_AUTO_LIGHT"), default=False):
+                return
             rgb = self._auto_rgb(att, med)
             try:
                 self._bus.publish(
@@ -102,6 +106,10 @@ class MetricsLightBridge:
         # Unknown mode — ignore quietly.
 
     def _auto_rgb(self, att: float, med: float) -> tuple[int, int, int]:
+        loaded = get_auto_rules_from_env()
+        if loaded is not None:
+            rules, idle = loaded
+            return rgb_from_auto_rules(att, med, rules, idle)
         # Meditation-first tie-break (same spirit as LedMatrix examples).
         calm_blue = (100, 150, 255)
         focus_warm = (255, 255, 200)
@@ -111,6 +119,36 @@ class MetricsLightBridge:
         if att >= self._att_thr:
             return focus_warm
         return idle
+
+
+def auto_rgb_from_metrics(attention: float, meditation: float) -> tuple[int, int, int]:
+    """Same RGB as авто-режим: JSON-правила (``NSP_LIGHT_AUTO_RULES_PATH``) или пороги ``NSP_LIGHT_AUTO_*``."""
+
+    loaded = get_auto_rules_from_env()
+    if loaded is not None:
+        rules, idle = loaded
+        try:
+            att = float(attention)
+            med = float(meditation)
+        except (TypeError, ValueError):
+            att, med = 0.0, 0.0
+        return rgb_from_auto_rules(att, med, rules, idle)
+
+    med_thr = _float_env("NSP_LIGHT_AUTO_MED_THRESHOLD", 70.0)
+    att_thr = _float_env("NSP_LIGHT_AUTO_ATT_THRESHOLD", 70.0)
+    try:
+        att = float(attention)
+        med = float(meditation)
+    except (TypeError, ValueError):
+        att, med = 0.0, 0.0
+    calm_blue = (100, 150, 255)
+    focus_warm = (255, 255, 200)
+    idle = (24, 28, 36)
+    if med >= med_thr:
+        return calm_blue
+    if att >= att_thr:
+        return focus_warm
+    return idle
 
 
 def try_attach_metrics_light_bridge(bus: EventBus) -> Callable[[], None]:
