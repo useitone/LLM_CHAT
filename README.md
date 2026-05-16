@@ -20,6 +20,7 @@
 | `docs/neuroexperimenter/` | Скриншоты интерфейса NeuroExperimenter (исторический референс) |
 | `docs/sweep-tone-generator/` | Скриншоты и описания приложения Sweep Tone Generator |
 | `docs/specs/` | Черновики ТЗ, приоритеты продукта, API, спецификации устройств |
+| `docs/light-ipixel.md` | Матрица iPIXEL: переменные окружения, ACK, PoC «Свет» |
 | `src/neurosync_pro/` | Код приложения (MVP): модули `eeg`, `audio`, точка входа CLI |
 
 **Установка каркаса для разработки** (из корня репозитория, желательно в venv):
@@ -48,6 +49,7 @@ neurosync-pro sweep-ui
 - **`docs/neuroexperimenter/screenshots/`** — скриншоты интерфейса (`nex59_2_0.jpg` … `nex59_2_8.jpg`).
 - **`docs/sweep-tone-generator/SweepToneGenerator.md`** — конспект возможностей Tone Generator PRO (Android); скрины в **`docs/sweep-tone-generator/screenshots/`** (`tone-generator-pro-android-*.png`).
 - **`docs/specs/product-priorities.md`** — зафиксированные приоритеты: медитация/концентрация, графики ЭЭГ, развитие аудиомодуля по мотивам Sweep Tone Generator и агенты.
+- **`docs/light-ipixel.md`** — свет iPIXEL: цепочка метрик → BLE, переменные `NSP_LIGHT_*`, ожидание ACK.
 - **`docs/specs/handoff-todo.md`** — TODO на будущее и напоминания после обновления чата.
 
 ## Что положить сюда

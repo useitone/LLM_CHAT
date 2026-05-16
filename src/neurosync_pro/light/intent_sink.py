@@ -9,13 +9,51 @@ For iPIXEL matrices use ``NSP_LIGHT_BLE_PROTOCOL=ipixel_png`` (solid PNG transfe
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import threading
+import time
 from typing import Any, Callable
 
 from neurosync_pro.bus import EventBus
 
 from neurosync_pro.light.ble_solid_worker import BleSolidRgbWorker, _truthy
+
+_intent_log_lock = threading.Lock()
+
+
+def _ipixel_brightness_clamped() -> int:
+    """Same 1…100 clamp as :func:`BleSolidRgbWorker._send_ipixel_init` (via ``_int_env``)."""
+
+    raw = os.environ.get("NSP_LIGHT_BLE_IPX_BRIGHTNESS")
+    if raw is None or str(raw).strip() == "":
+        return 80
+    try:
+        v = int(str(raw).strip(), 0)
+    except ValueError:
+        return 80
+    return max(1, min(100, v))
+
+
+def _append_intent_log_line(payload: dict[str, Any], rgb: tuple[int, int, int]) -> None:
+    path = (os.environ.get("NSP_LIGHT_INTENT_LOG") or "").strip()
+    if not path:
+        return
+    rec = {
+        "t_unix": time.time(),
+        "rgb": [int(rgb[0]), int(rgb[1]), int(rgb[2])],
+        "source": payload.get("source"),
+        "attention": payload.get("attention"),
+        "meditation": payload.get("meditation"),
+    }
+    line = json.dumps(rec, ensure_ascii=False) + "\n"
+    try:
+        with _intent_log_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+    except OSError:
+        pass
 
 
 class LightIntentSink:
@@ -26,7 +64,9 @@ class LightIntentSink:
         self._mode = (os.environ.get("NSP_LIGHT_SEND_MODE") or "log").strip().lower()
         self._worker: BleSolidRgbWorker | None = None
         self._unsub: Callable[[], None] | None = None
+        self._unsub_env: Callable[[], None] | None = None
         self._last_rgb: tuple[int, int, int] | None = None
+        self._last_ipx_brightness: int | None = None
 
     def attach(self) -> Callable[[], None]:
         if self._mode == "ble":
@@ -34,6 +74,7 @@ class LightIntentSink:
             self._worker.start()
 
         self._unsub = self._bus.subscribe("light.intent", self._on_intent)
+        self._unsub_env = self._bus.subscribe("light.env_updated", self._on_light_env_updated)
 
         def detach() -> None:
             if self._unsub is not None:
@@ -42,11 +83,28 @@ class LightIntentSink:
                 except Exception:
                     pass
                 self._unsub = None
+            if self._unsub_env is not None:
+                try:
+                    self._unsub_env()
+                except Exception:
+                    pass
+                self._unsub_env = None
             if self._worker is not None:
                 self._worker.stop()
                 self._worker = None
 
         return detach
+
+    def _on_light_env_updated(self, _payload: Any = None) -> None:
+        """После смены `NSP_LIGHT_BLE_IPX_BRIGHTNESS` в окружении — повторить последний RGB в BLE."""
+
+        b = _ipixel_brightness_clamped()
+        self._last_ipx_brightness = b
+        if self._mode != "ble" or self._worker is None:
+            return
+        if self._last_rgb is None:
+            return
+        self._worker.enqueue(self._last_rgb)
 
     def _on_intent(self, payload: Any) -> None:
         if not isinstance(payload, dict):
@@ -64,9 +122,12 @@ class LightIntentSink:
 
         if self._mode not in {"", "log", "debug", "ble"}:
             return
-        if tup == self._last_rgb:
+        blevel = _ipixel_brightness_clamped()
+        if tup == self._last_rgb and blevel == self._last_ipx_brightness:
             return
         self._last_rgb = tup
+        self._last_ipx_brightness = blevel
+        _append_intent_log_line(payload, tup)
 
         if self._mode in {"", "log", "debug"}:
             if _truthy(os.environ.get("NSP_LIGHT_SEND_DEBUG"), default=False):

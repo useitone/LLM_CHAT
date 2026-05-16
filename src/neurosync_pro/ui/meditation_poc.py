@@ -37,9 +37,9 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QProgressBar,
     QPushButton,
+    QSpinBox,
     QPlainTextEdit,
     QScrollArea,
-    QSpinBox,
     QSplitter,
     QTabWidget,
     QTextBrowser,
@@ -65,13 +65,22 @@ from neurosync_pro.agent_runtime.loop import (
 from neurosync_pro.agent_runtime.spec_validate import validate_prog_spec, validate_timeline_body
 from neurosync_pro.agent_runtime.user_profile import load_ui_profile, resolved_profile_path, save_ui_profile
 from neurosync_pro.bus import EventBus
+from neurosync_pro.light.metrics_auto_suppress import should_skip_metrics_auto_light_for_aux_sources
 from neurosync_pro.light.metrics_hook import try_attach_metrics_light_bridge
+from neurosync_pro.light.tone_from_light import (
+    parse_rgb_csv_env,
+    rgb_attention_volume_light,
+    rgb_meditation_volume_light,
+)
+from neurosync_pro.light.bin_pulse_map import half_period_ms_from_pulse_hz, pulse_hz_from_carrier
 from neurosync_pro.light.intent_sink import try_attach_light_intent_sink
 from neurosync_pro.eeg.ble_stream import normalize_ble_address
 from neurosync_pro.eeg.hr_filter import HrMedianSmoother
 from neurosync_pro.eeg.rr_extract import pick_rr_ms, rr_ms_to_bpm, try_extract_rr_ms_candidates
 from neurosync_pro.ui.ble_thread import BleNotifyThread, BleScanThread
 from neurosync_pro.ui.com_hr_thread import MacrotellectComHrThread
+from neurosync_pro.ui.tgam_com_thread import TgamComMetricsThread
+from neurosync_pro.ui.widgets_no_wheel import NoWheelComboBox
 try:  # optional audio extras
     from neurosync_pro.audio.stream import StreamConfig, ToneSweepStream
 except Exception:  # pragma: no cover
@@ -253,6 +262,7 @@ class MeditationMainWindow(QMainWindow):
         self._ble_duration_s = ble_duration_s
         self._ble_thread: BleNotifyThread | None = None
         self._ble_scan_thread: BleScanThread | None = None
+        self._tgam_com_thread: TgamComMetricsThread | None = None
         self._hr_com_thread: MacrotellectComHrThread | None = None
         self._session_log_path = session_log_path
         self._session_log_file: TextIOBase | None = None
@@ -287,7 +297,7 @@ class MeditationMainWindow(QMainWindow):
         self._eeg_tone_last_apply = 0.0
         self._eeg_tone_apply_min_s = 0.10  # 10 Hz
         self._eeg_tone_freq_src = "attention"  # attention|meditation
-        self._eeg_tone_vol_src = "meditation"  # off|attention|meditation
+        self._eeg_tone_vol_src = "meditation"  # off|attention|meditation|meditation_light|attention_light
         self._eeg_tone_fixed_vol = 0.08
         self._eeg_tone_mode = "mono"  # mono|stereo
 
@@ -328,6 +338,12 @@ class MeditationMainWindow(QMainWindow):
         self._eeg_bin_base_hz = 300.0
         self._eeg_bin_delta_hz = 8.0
         self._eeg_bin_last_delta_at = 0.0
+        self._eeg_bin_matrix_pulse_hz_lo = 0.5
+        self._eeg_bin_matrix_pulse_hz_hi = 12.0
+        self._bin_matrix_pulse_phase = False
+        self._bin_matrix_pulse_timer = QTimer(self)
+        self._bin_matrix_pulse_timer.setSingleShot(False)
+        self._bin_matrix_pulse_timer.timeout.connect(self._on_bin_matrix_pulse_tick)
 
         # Manual white noise (separate stream, can run alongside EEG→Tone).
         self._noise_available = ToneSweepStream is not None
@@ -809,11 +825,194 @@ class MeditationMainWindow(QMainWindow):
         self._api_cb = QCheckBox("Agent API :8765 (POST /v1/event JSON {topic, payload})")
         self._api_cb.toggled.connect(self._toggle_api)
 
+        self._light_box = QGroupBox("Свет (iPIXEL)")
+        self._light_box.setToolTip(
+            "Мост метрик → цвет и отправка на матрицу по BLE.\n"
+            "Без «Применить» используются переменные окружения NSP_LIGHT_* при старте; после правок жмите «Применить».\n"
+            "Надёжность ipixel_png: notify + ACK (как pypixelcolor); отключить: NSP_LIGHT_BLE_IPX_WAIT_ACK=0.\n"
+            "Полная таблица переменных: docs/light-ipixel.md"
+        )
+        lform = QFormLayout(self._light_box)
+        self._light_metrics_cb = QCheckBox("ЭЭГ → цвет (light.intent)")
+        self._light_metrics_cb.setToolTip("Включить расчёт RGB из Attention/Meditation (режим ниже).")
+        lform.addRow(self._light_metrics_cb)
+        self._light_mode_cb = NoWheelComboBox()
+        self._light_mode_cb.addItem("Авто (пороги → RGB)", userData="auto")
+        self._light_mode_cb.addItem("Только лог", userData="log")
+        lform.addRow("Режим цвета", self._light_mode_cb)
+        self._light_rules_path_le = QLineEdit()
+        self._light_rules_path_le.setPlaceholderText(
+            "Путь к JSON правил (пусто = пороги NSP_LIGHT_AUTO_*). См. docs/light-auto-rules.example.json"
+        )
+        self._light_rules_path_le.setToolTip(
+            "Файл: {\"idle\":[r,g,b],\"rules\":[{\"metric\":\"meditation\",\"op\":\">=\",\"value\":70,\"rgb\":[100,150,255]}, ...]}. "
+            "Правила по порядку; первое совпадение побеждает."
+        )
+        lform.addRow("Файл правил AUTO", self._light_rules_path_le)
+        self._light_send_cb = QCheckBox("Отправка на матрицу")
+        self._light_send_cb.setToolTip("Подписаться на light.intent и слать в BLE (режим ниже).")
+        lform.addRow(self._light_send_cb)
+        self._light_send_mode_cb = NoWheelComboBox()
+        self._light_send_mode_cb.addItem("Лог (stderr при отладке)", userData="log")
+        self._light_send_mode_cb.addItem("BLE", userData="ble")
+        lform.addRow("Куда слать", self._light_send_mode_cb)
+        self._light_proto_cb = NoWheelComboBox()
+        self._light_proto_cb.addItem("iPIXEL PNG (рекомендуется)", userData="ipixel_png")
+        self._light_proto_cb.addItem("Сырой кадр (prefix+RGB)", userData="raw")
+        lform.addRow("Протокол BLE", self._light_proto_cb)
+        self._light_mac_le = QLineEdit()
+        self._light_mac_le.setPlaceholderText("MAC матрицы, напр. E6:F5:E2:0F:40:7F")
+        lform.addRow("Адрес матрицы", self._light_mac_le)
+        wh_row = QWidget()
+        wh_lay = QHBoxLayout(wh_row)
+        wh_lay.setContentsMargins(0, 0, 0, 0)
+        self._light_w_spin = QSpinBox()
+        self._light_w_spin.setRange(8, 512)
+        self._light_w_spin.setValue(96)
+        self._light_h_spin = QSpinBox()
+        self._light_h_spin.setRange(8, 512)
+        self._light_h_spin.setValue(16)
+        wh_lay.addWidget(QLabel("Ширина"))
+        wh_lay.addWidget(self._light_w_spin)
+        wh_lay.addWidget(QLabel("Высота"))
+        wh_lay.addWidget(self._light_h_spin)
+        wh_lay.addStretch(1)
+        lform.addRow("Матрица (px)", wh_row)
+        self._light_bright_spin = QSpinBox()
+        self._light_bright_spin.setRange(1, 100)
+        self._light_bright_spin.setValue(80)
+        self._light_bright_spin.setToolTip(
+            "Яркость панели после команды включения (ipixel_png). "
+            "Меняется в окружении сразу при вращении (≈120 мс), без обязательного «Применить»."
+        )
+        lform.addRow("Яркость панели", self._light_bright_spin)
+        self._light_dry_cb = QCheckBox("Dry-run (без BLE, только лог в консоль)")
+        self._light_dry_cb.setToolTip("Безопасная проверка: радио не используется.")
+        lform.addRow(self._light_dry_cb)
+        self._light_fade_ms_spin = QSpinBox()
+        self._light_fade_ms_spin.setRange(0, 10000)
+        self._light_fade_ms_spin.setSingleStep(10)
+        self._light_fade_ms_spin.setValue(0)
+        self._light_fade_ms_spin.setSuffix(" мс")
+        self._light_fade_ms_spin.setToolTip(
+            "NSP_LIGHT_BLE_FADE_MS: плавный переход RGB (каждый шаг — полный кадр BLE). "
+            "0 = выкл. Между шагами fade не действует MIN_INTERVAL — возможен burst; на большой матрице "
+            "держите fade небольшим или задайте NSP_LIGHT_BLE_FADE_MAX_STEPS / FADE_MIN_STEP_S / "
+            "FADE_RESPECT_MIN_INTERVAL (см. docs/light-ipixel.md и docs/light-hardware-checklist.md)."
+        )
+        lform.addRow("Fade между цветами", self._light_fade_ms_spin)
+        self._light_fade_max_steps_spin = QSpinBox()
+        self._light_fade_max_steps_spin.setRange(2, 64)
+        self._light_fade_max_steps_spin.setValue(32)
+        self._light_fade_max_steps_spin.setToolTip(
+            "NSP_LIGHT_BLE_FADE_MAX_STEPS: верхняя граница числа шагов fade (полных кадров BLE за переход)."
+        )
+        lform.addRow("Fade max steps", self._light_fade_max_steps_spin)
+        self._light_fade_min_step_spin = QDoubleSpinBox()
+        self._light_fade_min_step_spin.setRange(0.0, 3.0)
+        self._light_fade_min_step_spin.setDecimals(2)
+        self._light_fade_min_step_spin.setSingleStep(0.01)
+        self._light_fade_min_step_spin.setSuffix(" с")
+        self._light_fade_min_step_spin.setToolTip(
+            "NSP_LIGHT_BLE_FADE_MIN_STEP_S: минимальная пауза между шагами fade после каждого полного кадра."
+        )
+        lform.addRow("Fade min step", self._light_fade_min_step_spin)
+        self._light_fade_respect_min_iv_cb = QCheckBox("Fade: уважать BLE MIN_INTERVAL")
+        self._light_fade_respect_min_iv_cb.setToolTip(
+            "NSP_LIGHT_BLE_FADE_RESPECT_MIN_INTERVAL: если включено — между шагами fade не меньше "
+            "NSP_LIGHT_BLE_MIN_INTERVAL_S (вместе с Fade min step берётся максимум)."
+        )
+        lform.addRow(self._light_fade_respect_min_iv_cb)
+        self._light_ble_retry_debug_cb = QCheckBox("Лог повторов кадра BLE (stderr)")
+        self._light_ble_retry_debug_cb.setToolTip(
+            "NSP_LIGHT_BLE_RETRY_DEBUG: при ошибках передачи — строки в stderr о попытках и успехе после повтора."
+        )
+        lform.addRow(self._light_ble_retry_debug_cb)
+        self._light_pulse_hz_spin = QDoubleSpinBox()
+        self._light_pulse_hz_spin.setRange(0.0, 25.0)
+        self._light_pulse_hz_spin.setDecimals(2)
+        self._light_pulse_hz_spin.setSingleStep(0.1)
+        self._light_pulse_hz_spin.setValue(0.0)
+        self._light_pulse_hz_spin.setSuffix(" Гц")
+        self._light_pulse_hz_spin.setToolTip(
+            "NSP_LIGHT_BLE_PULSE_HZ: после установки цвета — «дыхание» яркости до следующего RGB в очереди. 0 = выкл."
+        )
+        lform.addRow("Пульс (яркость)", self._light_pulse_hz_spin)
+        self._light_frame_retries_spin = QSpinBox()
+        self._light_frame_retries_spin.setRange(1, 10)
+        self._light_frame_retries_spin.setValue(2)
+        self._light_frame_retries_spin.setToolTip(
+            "NSP_LIGHT_BLE_FRAME_RETRIES: сколько раз повторять полный кадр при ошибке (таймаут ACK, обрыв)."
+        )
+        lform.addRow("Повторы кадра при ошибке", self._light_frame_retries_spin)
+        self._light_frame_retry_delay_spin = QDoubleSpinBox()
+        self._light_frame_retry_delay_spin.setRange(0.0, 3.0)
+        self._light_frame_retry_delay_spin.setDecimals(2)
+        self._light_frame_retry_delay_spin.setSingleStep(0.05)
+        self._light_frame_retry_delay_spin.setValue(0.15)
+        self._light_frame_retry_delay_spin.setSuffix(" с")
+        self._light_frame_retry_delay_spin.setToolTip(
+            "NSP_LIGHT_BLE_FRAME_RETRY_DELAY_S: пауза между повторами полного кадра."
+        )
+        lform.addRow("Пауза между повторами", self._light_frame_retry_delay_spin)
+        self._light_debug_cb = QCheckBox("Лог отправки [light][send] в stderr")
+        self._light_debug_cb.setToolTip("Только для режима «Лог».")
+        lform.addRow(self._light_debug_cb)
+        self._light_intent_log_le = QLineEdit()
+        self._light_intent_log_le.setPlaceholderText(
+            "Файл лога каждого принятого light.intent (JSON по строке). Пусто = не писать. Переменная NSP_LIGHT_INTENT_LOG."
+        )
+        lform.addRow("Лог intents → файл", self._light_intent_log_le)
+        self._light_manual_hold_cb = QCheckBox("Удерживать ручной RGB (не слать авто с метрик)")
+        self._light_manual_hold_cb.setToolTip(
+            "Пока включено: на каждом eeg.metrics мост «ЭЭГ→цвет» не публикует light.intent "
+            "(как при Volume+Light / пульсе бинаурала). Кнопка ниже шлёт один кадр в шину."
+        )
+        lform.addRow(self._light_manual_hold_cb)
+        self._light_manual_preset_cb = NoWheelComboBox()
+        self._light_manual_preset_cb.addItem("Пресет: —", userData=None)
+        self._light_manual_preset_cb.addItem("idle", userData="idle")
+        self._light_manual_preset_cb.addItem("calm_blue", userData="calm")
+        self._light_manual_preset_cb.addItem("focus_warm", userData="focus")
+        self._light_manual_preset_cb.currentIndexChanged.connect(self._light_manual_preset_changed)
+        lform.addRow(self._light_manual_preset_cb)
+        man_row = QWidget()
+        man_lay = QHBoxLayout(man_row)
+        man_lay.setContentsMargins(0, 0, 0, 0)
+        man_lay.addWidget(QLabel("R"))
+        self._light_manual_r = QSpinBox()
+        self._light_manual_r.setRange(0, 255)
+        self._light_manual_r.setValue(100)
+        man_lay.addWidget(self._light_manual_r)
+        man_lay.addWidget(QLabel("G"))
+        self._light_manual_g = QSpinBox()
+        self._light_manual_g.setRange(0, 255)
+        self._light_manual_g.setValue(150)
+        man_lay.addWidget(self._light_manual_g)
+        man_lay.addWidget(QLabel("B"))
+        self._light_manual_b = QSpinBox()
+        self._light_manual_b.setRange(0, 255)
+        self._light_manual_b.setValue(255)
+        man_lay.addWidget(self._light_manual_b)
+        self._light_manual_apply_btn = QPushButton("Применить ручной RGB")
+        self._light_manual_apply_btn.setToolTip("Публикация light.intent (source: light_manual) для sink/BLE.")
+        self._light_manual_apply_btn.clicked.connect(self._light_manual_apply_clicked)
+        man_lay.addWidget(self._light_manual_apply_btn)
+        man_lay.addStretch(1)
+        lform.addRow("Ручной RGB", man_row)
+        self._light_apply_btn = QPushButton("Применить настройки света")
+        self._light_apply_btn.setToolTip(
+            "Перечитать поля → переменные окружения и переподключить мосты (без перезапуска приложения). "
+            "Также записывает RGB из блоков «Цвета Volume+Light» и «Цвета пульса матрицы» (EEG→Tone / Binaural), "
+            "а также fade max steps / fade min step / fade respect MIN_INTERVAL / лог повторов BLE."
+        )
+        self._light_apply_btn.clicked.connect(self._reload_light_bridges)
+        lform.addRow(self._light_apply_btn)
+
         # Programmer bus bridge (agent → UI).
         self._bus.subscribe("program.set_spec", self._on_program_set_spec)
         self._bus.subscribe("program.set_timeline", self._on_program_set_timeline)
         self._bus.subscribe("program.stop", lambda _p: self._prog_stop())
-        # Optional EEG→light bridges attached after «Свет» UI is built (_reattach_light_bridges).
 
         self._plot_cb = QCheckBox("График (Attention / Meditation)")
         self._plot_cb.setEnabled(self._plot_available)
@@ -886,6 +1085,8 @@ class MeditationMainWindow(QMainWindow):
         self._tone_vol_src.addItem("Volume: Off (fixed)", userData="off")
         self._tone_vol_src.addItem("Meditation → Volume", userData="meditation")
         self._tone_vol_src.addItem("Attention → Volume", userData="attention")
+        self._tone_vol_src.addItem("Meditation → Volume + Light", userData="meditation_light")
+        self._tone_vol_src.addItem("Attention → Volume + Light", userData="attention_light")
         self._tone_vol_src.setCurrentIndex(1)
         self._tone_vol_src.currentIndexChanged.connect(self._tone_vol_src_changed)
 
@@ -895,6 +1096,74 @@ class MeditationMainWindow(QMainWindow):
         self._tone_fixed_vol.setValue(self._eeg_tone_fixed_vol)
         self._tone_fixed_vol.valueChanged.connect(lambda v: setattr(self, "_eeg_tone_fixed_vol", float(v)))
         self._tone_fixed_vol.setEnabled(False)
+
+        vol_light_colors = QGroupBox("Цвета Volume+Light (Mono)")
+        vol_light_colors.setToolTip(
+            "RGB для light.intent в режимах Meditation/Attention → Volume+Light. "
+            "Пороги M/A — как NSP_LIGHT_AUTO_MED_THRESHOLD / NSP_LIGHT_AUTO_ATT_THRESHOLD. "
+            "В os.environ при «Применить настройки света»: NSP_LIGHT_VOL_LIGHT_*_RGB."
+        )
+        vcol = QVBoxLayout(vol_light_colors)
+        r1 = QWidget()
+        h1 = QHBoxLayout(r1)
+        h1.setContentsMargins(0, 0, 0, 0)
+        h1.addWidget(QLabel("M ≥ порога"))
+        self._vl_med_hi_r = QSpinBox()
+        self._vl_med_hi_g = QSpinBox()
+        self._vl_med_hi_b = QSpinBox()
+        for s in (self._vl_med_hi_r, self._vl_med_hi_g, self._vl_med_hi_b):
+            s.setRange(0, 255)
+        self._vl_med_hi_r.setValue(100)
+        self._vl_med_hi_g.setValue(150)
+        self._vl_med_hi_b.setValue(255)
+        h1.addWidget(self._vl_med_hi_r)
+        h1.addWidget(self._vl_med_hi_g)
+        h1.addWidget(self._vl_med_hi_b)
+        h1.addSpacing(8)
+        h1.addWidget(QLabel("M < порога"))
+        self._vl_med_lo_r = QSpinBox()
+        self._vl_med_lo_g = QSpinBox()
+        self._vl_med_lo_b = QSpinBox()
+        for s in (self._vl_med_lo_r, self._vl_med_lo_g, self._vl_med_lo_b):
+            s.setRange(0, 255)
+        self._vl_med_lo_r.setValue(24)
+        self._vl_med_lo_g.setValue(28)
+        self._vl_med_lo_b.setValue(36)
+        h1.addWidget(self._vl_med_lo_r)
+        h1.addWidget(self._vl_med_lo_g)
+        h1.addWidget(self._vl_med_lo_b)
+        h1.addStretch(1)
+        vcol.addWidget(r1)
+        r2 = QWidget()
+        h2 = QHBoxLayout(r2)
+        h2.setContentsMargins(0, 0, 0, 0)
+        h2.addWidget(QLabel("A ≥ порога"))
+        self._vl_att_hi_r = QSpinBox()
+        self._vl_att_hi_g = QSpinBox()
+        self._vl_att_hi_b = QSpinBox()
+        for s in (self._vl_att_hi_r, self._vl_att_hi_g, self._vl_att_hi_b):
+            s.setRange(0, 255)
+        self._vl_att_hi_r.setValue(255)
+        self._vl_att_hi_g.setValue(255)
+        self._vl_att_hi_b.setValue(200)
+        h2.addWidget(self._vl_att_hi_r)
+        h2.addWidget(self._vl_att_hi_g)
+        h2.addWidget(self._vl_att_hi_b)
+        h2.addSpacing(8)
+        h2.addWidget(QLabel("A < порога"))
+        self._vl_att_lo_r = QSpinBox()
+        self._vl_att_lo_g = QSpinBox()
+        self._vl_att_lo_b = QSpinBox()
+        for s in (self._vl_att_lo_r, self._vl_att_lo_g, self._vl_att_lo_b):
+            s.setRange(0, 255)
+        self._vl_att_lo_r.setValue(24)
+        self._vl_att_lo_g.setValue(28)
+        self._vl_att_lo_b.setValue(36)
+        h2.addWidget(self._vl_att_lo_r)
+        h2.addWidget(self._vl_att_lo_g)
+        h2.addWidget(self._vl_att_lo_b)
+        h2.addStretch(1)
+        vcol.addWidget(r2)
 
         self._eeg_tone_stereo_box = QGroupBox("Stereo (L/R) mapping")
         self._eeg_tone_stereo_box.setVisible(False)
@@ -1024,6 +1293,7 @@ class MeditationMainWindow(QMainWindow):
         form.addRow("Vol max", self._tone_max_vol)
         form.addRow("Vol source", self._tone_vol_src)
         form.addRow("Fixed vol", self._tone_fixed_vol)
+        form.addRow(vol_light_colors)
         form.addRow(self._eeg_tone_stereo_box)
 
         self._eeg_bin_cb = QCheckBox("EEG → Binaural (stereo, random Δf)")
@@ -1078,6 +1348,66 @@ class MeditationMainWindow(QMainWindow):
         bform.addRow("Δf max", self._bin_delta_max)
         bform.addRow("Δf update", self._bin_delta_update)
         bform.addRow("Volume", self._bin_vol)
+        self._bin_matrix_pulse_cb = QCheckBox("Матрица: пульс от несущей (эксперимент, лимит BLE)")
+        self._bin_matrix_pulse_cb.setToolTip(
+            "Частота мерцания между двумя RGB (фазы A/B ниже) от сглаженной несущей (Base min–max Гц) "
+            "в диапазон «Пульс Гц min–max». Реальная скорость ограничена NSP_LIGHT_BLE_MIN_INTERVAL_S. "
+            "При включённой галочке авто light.intent с моста метрик подавляется на кадре eeg.metrics."
+        )
+        self._bin_matrix_pulse_cb.toggled.connect(self._bin_matrix_pulse_toggled)
+        bform.addRow(self._bin_matrix_pulse_cb)
+        self._bin_pulse_hz_min = QDoubleSpinBox()
+        self._bin_pulse_hz_min.setRange(0.05, 120.0)
+        self._bin_pulse_hz_min.setDecimals(2)
+        self._bin_pulse_hz_min.setSuffix(" Hz")
+        self._bin_pulse_hz_min.setValue(self._eeg_bin_matrix_pulse_hz_lo)
+        self._bin_pulse_hz_min.valueChanged.connect(self._bin_pulse_hz_bounds_changed)
+        self._bin_pulse_hz_max = QDoubleSpinBox()
+        self._bin_pulse_hz_max.setRange(0.05, 120.0)
+        self._bin_pulse_hz_max.setDecimals(2)
+        self._bin_pulse_hz_max.setSuffix(" Hz")
+        self._bin_pulse_hz_max.setValue(self._eeg_bin_matrix_pulse_hz_hi)
+        self._bin_pulse_hz_max.valueChanged.connect(self._bin_pulse_hz_bounds_changed)
+        bform.addRow("Пульс Гц min", self._bin_pulse_hz_min)
+        bform.addRow("Пульс Гц max", self._bin_pulse_hz_max)
+
+        bin_pulse_colors = QGroupBox("Цвета пульса матрицы (две фазы)")
+        bin_pulse_colors.setToolTip(
+            "Чередование RGB для light.intent (source: eeg_bin_matrix_pulse). "
+            "В os.environ при «Применить настройки света»: NSP_LIGHT_BIN_PULSE_RGB_A / _B."
+        )
+        bpc = QVBoxLayout(bin_pulse_colors)
+        bp_row = QWidget()
+        bph = QHBoxLayout(bp_row)
+        bph.setContentsMargins(0, 0, 0, 0)
+        bph.addWidget(QLabel("Фаза A"))
+        self._bin_ph_a_r = QSpinBox()
+        self._bin_ph_a_g = QSpinBox()
+        self._bin_ph_a_b = QSpinBox()
+        for s in (self._bin_ph_a_r, self._bin_ph_a_g, self._bin_ph_a_b):
+            s.setRange(0, 255)
+        self._bin_ph_a_r.setValue(100)
+        self._bin_ph_a_g.setValue(150)
+        self._bin_ph_a_b.setValue(255)
+        bph.addWidget(self._bin_ph_a_r)
+        bph.addWidget(self._bin_ph_a_g)
+        bph.addWidget(self._bin_ph_a_b)
+        bph.addSpacing(8)
+        bph.addWidget(QLabel("Фаза B"))
+        self._bin_ph_b_r = QSpinBox()
+        self._bin_ph_b_g = QSpinBox()
+        self._bin_ph_b_b = QSpinBox()
+        for s in (self._bin_ph_b_r, self._bin_ph_b_g, self._bin_ph_b_b):
+            s.setRange(0, 255)
+        self._bin_ph_b_r.setValue(24)
+        self._bin_ph_b_g.setValue(28)
+        self._bin_ph_b_b.setValue(36)
+        bph.addWidget(self._bin_ph_b_r)
+        bph.addWidget(self._bin_ph_b_g)
+        bph.addWidget(self._bin_ph_b_b)
+        bph.addStretch(1)
+        bpc.addWidget(bp_row)
+        bform.addRow(bin_pulse_colors)
 
         # BLE scan controls (when address not passed explicitly).
         self._ble_scan_btn = QPushButton("Сканировать BrainLink")
@@ -1323,67 +1653,45 @@ class MeditationMainWindow(QMainWindow):
             bh.addWidget(self._ble_start)
             bh.addWidget(self._ble_stop)
             left_lay.addWidget(btn_row)
-
-        self._light_box = QGroupBox("Свет (матрица iPIXEL)")
-        self._light_box.setToolTip(
-            "Без ручного PowerShell: включите галочки и «Применить свет». "
-            "Значения синхронизируются с переменными NSP_LIGHT_* / NSP_LIGHT_BLE_* "
-            "и сохраняются в профиль при закрытии окна."
+        tgam_box = QGroupBox("TGAM COM (ThinkGear, исслед.)")
+        tgam_box.setToolTip(
+            "Дополнительный источник Attention/Meditation по классическому serial-пакету "
+            "(0xAA 0xAA, см. neurosync_pro.eeg.tgam_serial_parser и docs/brain_master_parser.py). "
+            "Не заменяет BLE BrainLink: не запускайте оба потока одновременно.\n"
+            "Переменные: NSP_TGAM_COM_PORT, NSP_TGAM_COM_BAUD и др. (см. tgam_com_thread.py)."
         )
-        light_form = QFormLayout(self._light_box)
-        light_form.setContentsMargins(8, 4, 8, 4)
-        light_form.setSpacing(4)
-        self._light_enable_cb = QCheckBox("ЭЭГ → цвет (light.intent)")
-        self._light_mode_cb = QComboBox()
-        self._light_mode_cb.addItem("auto → RGB", userData="auto")
-        self._light_mode_cb.addItem("log (stderr)", userData="log")
-        self._light_send_cb = QCheckBox("Отправлять на матрицу")
-        self._light_send_mode_cb = QComboBox()
-        self._light_send_mode_cb.addItem("BLE", userData="ble")
-        self._light_send_mode_cb.addItem("log stderr", userData="log")
-        self._light_proto_cb = QComboBox()
-        self._light_proto_cb.addItem("ipixel_png", userData="ipixel_png")
-        self._light_proto_cb.addItem("raw (prefix+RGB)", userData="raw")
-        self._light_addr_le = QLineEdit()
-        self._light_addr_le.setPlaceholderText("MAC матрицы (напр. E6:F5:E2:0F:40:7F)")
-        self._light_w_spin = QSpinBox()
-        self._light_w_spin.setRange(1, 2048)
-        self._light_h_spin = QSpinBox()
-        self._light_h_spin.setRange(1, 2048)
-        self._light_brightness_spin = QSpinBox()
-        self._light_brightness_spin.setRange(1, 100)
-        self._light_dry_cb = QCheckBox("Только dry-run (без радиосвязи)")
-        self._light_ipx_init_cb = QCheckBox("При подключении: power + яркость")
-        self._light_apply_btn = QPushButton("Применить свет")
-        self._light_apply_btn.setToolTip(
-            "Переподписать мосты EEG→intent и intent→BLE без перезапуска приложения."
-        )
-        self._light_apply_btn.clicked.connect(self._light_apply_clicked)
-
-        light_form.addRow(self._light_enable_cb)
-        light_form.addRow("Режим метрик:", self._light_mode_cb)
-        light_form.addRow(self._light_send_cb)
-        light_form.addRow("Отправка intent:", self._light_send_mode_cb)
-        light_form.addRow("Протокол BLE:", self._light_proto_cb)
-        light_form.addRow("MAC матрицы:", self._light_addr_le)
-        _light_wh = QWidget()
-        _light_wh_lay = QHBoxLayout(_light_wh)
-        _light_wh_lay.setContentsMargins(0, 0, 0, 0)
-        _light_wh_lay.addWidget(QLabel("Ширина"))
-        _light_wh_lay.addWidget(self._light_w_spin)
-        _light_wh_lay.addWidget(QLabel("Высота"))
-        _light_wh_lay.addWidget(self._light_h_spin)
-        light_form.addRow("Размер заливки:", _light_wh)
-        light_form.addRow("Яркость (старт):", self._light_brightness_spin)
-        light_form.addRow(self._light_dry_cb)
-        light_form.addRow(self._light_ipx_init_cb)
-        light_form.addRow(self._light_apply_btn)
-
-        left_lay.addWidget(self._light_box)
-        self._light_fill_widgets_from_env_or_profile()
-        self._reattach_light_bridges()
-
+        tgam_lay = QFormLayout(tgam_box)
+        self._tgam_com_port_le = QLineEdit()
+        self._tgam_com_port_le.setPlaceholderText("COM3")
+        env_tport = (os.environ.get("NSP_TGAM_COM_PORT") or "").strip()
+        if env_tport:
+            self._tgam_com_port_le.setText(env_tport)
+        tgam_lay.addRow("Порт", self._tgam_com_port_le)
+        self._tgam_com_baud_spin = QSpinBox()
+        self._tgam_com_baud_spin.setRange(1200, 921_600)
+        self._tgam_com_baud_spin.setSingleStep(1200)
+        self._tgam_com_baud_spin.setValue(57600)
+        try:
+            tb = int(str(os.environ.get("NSP_TGAM_COM_BAUD") or "57600").strip(), 0)
+            self._tgam_com_baud_spin.setValue(max(1200, min(921_600, tb)))
+        except (TypeError, ValueError):
+            pass
+        tgam_lay.addRow("Скорость", self._tgam_com_baud_spin)
+        tgam_btn_row = QWidget()
+        tgam_btn_h = QHBoxLayout(tgam_btn_row)
+        tgam_btn_h.setContentsMargins(0, 0, 0, 0)
+        self._tgam_com_start_btn = QPushButton("Старт TGAM COM")
+        self._tgam_com_stop_btn = QPushButton("Стоп TGAM COM")
+        self._tgam_com_stop_btn.setEnabled(False)
+        self._tgam_com_start_btn.clicked.connect(self._start_tgam_com)
+        self._tgam_com_stop_btn.clicked.connect(self._stop_tgam_com)
+        tgam_btn_h.addWidget(self._tgam_com_start_btn)
+        tgam_btn_h.addWidget(self._tgam_com_stop_btn)
+        tgam_btn_h.addStretch(1)
+        tgam_lay.addRow(tgam_btn_row)
+        left_lay.addWidget(tgam_box)
         left_lay.addWidget(self._api_cb)
+        left_lay.addWidget(self._light_box)
         left_lay.addWidget(self._status)
         left_lay.addStretch(1)
 
@@ -1394,6 +1702,18 @@ class MeditationMainWindow(QMainWindow):
             self._hr_source_cb.setCurrentIndex(0)
         self._hr_com_port_le.setText(self._hr_com_port or "COM3")
         self._refresh_etalon_status()
+
+        self._light_sync_widgets_from_env()
+        self._light_overlay_profile_widgets()
+        self._sync_light_env_from_ui()
+        self._light_bridge_detach = try_attach_metrics_light_bridge(self._bus)
+        self._light_send_detach = try_attach_light_intent_sink(self._bus)
+
+        self._light_brightness_apply_timer = QTimer(self)
+        self._light_brightness_apply_timer.setSingleShot(True)
+        self._light_brightness_apply_timer.setInterval(120)
+        self._light_brightness_apply_timer.timeout.connect(self._apply_light_brightness_to_env_and_ble)
+        self._light_bright_spin.valueChanged.connect(self._schedule_light_brightness_apply)
 
         self.setCentralWidget(cw)
         self.resize(1180, 700)
@@ -1424,7 +1744,7 @@ class MeditationMainWindow(QMainWindow):
 
     def _tone_vol_src_changed(self, _idx: int) -> None:
         data = self._tone_vol_src.currentData()
-        if data in ("off", "attention", "meditation"):
+        if data in ("off", "attention", "meditation", "meditation_light", "attention_light"):
             self._eeg_tone_vol_src = str(data)
         self._tone_fixed_vol.setEnabled(self._eeg_tone_vol_src == "off")
 
@@ -1771,6 +2091,7 @@ class MeditationMainWindow(QMainWindow):
         return True
 
     def _stop_eeg_binaural(self) -> None:
+        self._stop_bin_matrix_pulse_timer()
         st = self._eeg_bin_stream
         self._eeg_bin_stream = None
         if st is not None:
@@ -2032,128 +2353,507 @@ class MeditationMainWindow(QMainWindow):
     def _chat_save_profile(self) -> None:
         if not hasattr(self, "_chat_base_url"):
             return
-        payload: dict[str, Any] = {
-            "ollama_base_url": self._chat_base_url.text().strip(),
-            "ollama_model": self._chat_model.text().strip(),
-            "chat_free_form": self._chat_free_cb.isChecked(),
-            "chat_auto_apply": self._chat_auto_apply_cb.isChecked(),
-            "chat_agent_runtime_policy": self._chat_agent_runtime_policy_cb.isChecked(),
-            "chat_freeflight": self._chat_freeflight_cb.isChecked(),
-        }
-        if hasattr(self, "_light_enable_cb"):
-            payload.update(self._light_pack_profile())
-        save_ui_profile(payload, resolved_profile_path())
+        merged = load_ui_profile(resolved_profile_path())
+        merged.update(
+            {
+                "ollama_base_url": self._chat_base_url.text().strip(),
+                "ollama_model": self._chat_model.text().strip(),
+                "chat_free_form": self._chat_free_cb.isChecked(),
+                "chat_auto_apply": self._chat_auto_apply_cb.isChecked(),
+                "chat_agent_runtime_policy": self._chat_agent_runtime_policy_cb.isChecked(),
+                "chat_freeflight": self._chat_freeflight_cb.isChecked(),
+            }
+        )
+        if hasattr(self, "_light_mac_le"):
+            try:
+                merged["light_ui"] = self._light_profile_dict()
+            except Exception:
+                pass
+        try:
+            save_ui_profile(merged, resolved_profile_path())
+        except OSError:
+            pass
 
-    def _light_pack_profile(self) -> dict[str, Any]:
-        return {
-            "light_enabled": self._light_enable_cb.isChecked(),
-            "light_mode": str(self._light_mode_cb.currentData() or "auto"),
-            "light_send_enabled": self._light_send_cb.isChecked(),
-            "light_send_mode": str(self._light_send_mode_cb.currentData() or "ble"),
-            "light_ble_protocol": str(self._light_proto_cb.currentData() or "ipixel_png"),
-            "light_ble_address": self._light_addr_le.text().strip(),
-            "light_matrix_w": int(self._light_w_spin.value()),
-            "light_matrix_h": int(self._light_h_spin.value()),
-            "light_ble_brightness": int(self._light_brightness_spin.value()),
-            "light_ble_dry_run": self._light_dry_cb.isChecked(),
-            "light_ble_ipx_init": self._light_ipx_init_cb.isChecked(),
+    def _light_profile_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "metrics": self._light_metrics_cb.isChecked(),
+            "mode": self._light_mode_cb.currentData(),
+            "send": self._light_send_cb.isChecked(),
+            "send_mode": self._light_send_mode_cb.currentData(),
+            "protocol": self._light_proto_cb.currentData(),
+            "matrix_mac": self._light_mac_le.text().strip(),
+            "matrix_w": int(self._light_w_spin.value()),
+            "matrix_h": int(self._light_h_spin.value()),
+            "dry_run": self._light_dry_cb.isChecked(),
+            "brightness": int(self._light_bright_spin.value()),
+            "send_debug": self._light_debug_cb.isChecked(),
+            "manual_hold": self._light_manual_hold_cb.isChecked(),
+            "manual_r": int(self._light_manual_r.value()),
+            "manual_g": int(self._light_manual_g.value()),
+            "manual_b": int(self._light_manual_b.value()),
+            "auto_rules_path": self._light_rules_path_le.text().strip(),
+            "intent_log_path": self._light_intent_log_le.text().strip(),
         }
+        fade = getattr(self, "_light_fade_ms_spin", None)
+        if fade is not None:
+            d["ble_fade_ms"] = int(fade.value())
+        pulse = getattr(self, "_light_pulse_hz_spin", None)
+        if pulse is not None:
+            d["ble_pulse_hz"] = float(pulse.value())
+        fret = getattr(self, "_light_frame_retries_spin", None)
+        if fret is not None:
+            d["ble_frame_retries"] = int(fret.value())
+        fdel = getattr(self, "_light_frame_retry_delay_spin", None)
+        if fdel is not None:
+            d["ble_frame_retry_delay_s"] = float(fdel.value())
+        fm = getattr(self, "_light_fade_max_steps_spin", None)
+        if fm is not None:
+            d["ble_fade_max_steps"] = int(fm.value())
+        fms = getattr(self, "_light_fade_min_step_spin", None)
+        if fms is not None:
+            d["ble_fade_min_step_s"] = float(fms.value())
+        fri = getattr(self, "_light_fade_respect_min_iv_cb", None)
+        if fri is not None:
+            d["ble_fade_respect_min_interval"] = bool(fri.isChecked())
+        rdb = getattr(self, "_light_ble_retry_debug_cb", None)
+        if rdb is not None:
+            d["ble_retry_debug"] = bool(rdb.isChecked())
+        if getattr(self, "_vl_med_hi_r", None) is not None:
+            d["vol_light_med_hi"] = [
+                int(self._vl_med_hi_r.value()),
+                int(self._vl_med_hi_g.value()),
+                int(self._vl_med_hi_b.value()),
+            ]
+            d["vol_light_med_lo"] = [
+                int(self._vl_med_lo_r.value()),
+                int(self._vl_med_lo_g.value()),
+                int(self._vl_med_lo_b.value()),
+            ]
+            d["vol_light_att_hi"] = [
+                int(self._vl_att_hi_r.value()),
+                int(self._vl_att_hi_g.value()),
+                int(self._vl_att_hi_b.value()),
+            ]
+            d["vol_light_att_lo"] = [
+                int(self._vl_att_lo_r.value()),
+                int(self._vl_att_lo_g.value()),
+                int(self._vl_att_lo_b.value()),
+            ]
+        if getattr(self, "_bin_ph_a_r", None) is not None:
+            d["bin_pulse_a"] = [
+                int(self._bin_ph_a_r.value()),
+                int(self._bin_ph_a_g.value()),
+                int(self._bin_ph_a_b.value()),
+            ]
+            d["bin_pulse_b"] = [
+                int(self._bin_ph_b_r.value()),
+                int(self._bin_ph_b_g.value()),
+                int(self._bin_ph_b_b.value()),
+            ]
+        return d
 
-    def _light_set_combo_by_data(self, combo: QComboBox, value: str) -> None:
-        v = (value or "").strip().lower()
-        for i in range(combo.count()):
-            d = combo.itemData(i)
-            if d is not None and str(d).strip().lower() == v:
-                combo.setCurrentIndex(i)
+    def _set_light_combo(self, cb: QComboBox, value: str) -> None:
+        v = str(value).strip().lower()
+        for i in range(cb.count()):
+            if str(cb.itemData(i)).strip().lower() == v:
+                cb.setCurrentIndex(i)
                 return
 
-    def _light_fill_widgets_from_env_or_profile(self) -> None:
-        prof = load_ui_profile(resolved_profile_path())
-
-        def _env_bool(key: str, pkey: str, default: bool) -> bool:
-            raw = os.environ.get(key)
-            if raw is not None and str(raw).strip() != "":
-                return str(raw).strip().lower() in ("1", "true", "yes", "on")
-            if pkey in prof:
-                return bool(prof.get(pkey))
+    def _light_truthy_env(self, name: str, *, default: bool = False) -> bool:
+        raw = os.environ.get(name)
+        if raw is None or str(raw).strip() == "":
             return default
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
-        def _env_str(key: str, pkey: str, default: str = "") -> str:
-            raw = os.environ.get(key)
-            if raw is not None:
-                s = str(raw).strip()
-                if s != "":
-                    return s
-            v = prof.get(pkey)
-            if v is not None and str(v).strip() != "":
-                return str(v).strip()
-            return default
-
-        def _env_int(key: str, pkey: str, default: int) -> int:
-            raw = os.environ.get(key)
-            if raw is not None and str(raw).strip() != "":
-                try:
-                    return int(str(raw).strip(), 0)
-                except ValueError:
-                    pass
+    def _light_sync_widgets_from_env(self) -> None:
+        """Seed widgets from process environment (e.g. PowerShell $env:… before launch)."""
+        self._light_metrics_cb.setChecked(self._light_truthy_env("NSP_LIGHT_ENABLED"))
+        mode = (os.environ.get("NSP_LIGHT_MODE") or "auto").strip().lower()
+        self._set_light_combo(self._light_mode_cb, mode if mode in ("auto", "log") else "auto")
+        self._light_send_cb.setChecked(self._light_truthy_env("NSP_LIGHT_SEND_ENABLED"))
+        sm = (os.environ.get("NSP_LIGHT_SEND_MODE") or "log").strip().lower()
+        self._set_light_combo(self._light_send_mode_cb, sm if sm in ("log", "ble") else "log")
+        proto = (os.environ.get("NSP_LIGHT_BLE_PROTOCOL") or "ipixel_png").strip().lower()
+        self._set_light_combo(self._light_proto_cb, proto if proto in ("raw", "ipixel_png") else "ipixel_png")
+        mac = (os.environ.get("NSP_LIGHT_BLE_ADDRESS") or "").strip()
+        if mac:
+            self._light_mac_le.setText(mac)
+        try:
+            w = int(str(os.environ.get("NSP_LIGHT_BLE_MATRIX_W") or "96").strip(), 0)
+            h = int(str(os.environ.get("NSP_LIGHT_BLE_MATRIX_H") or "16").strip(), 0)
+            self._light_w_spin.setValue(max(8, min(512, w)))
+            self._light_h_spin.setValue(max(8, min(512, h)))
+        except (TypeError, ValueError):
+            pass
+        # Safe default for dry-run when unset: True.
+        self._light_dry_cb.setChecked(self._light_truthy_env("NSP_LIGHT_BLE_DRY_RUN", default=True))
+        try:
+            br = int(float(str(os.environ.get("NSP_LIGHT_BLE_IPX_BRIGHTNESS") or "80").strip()))
+            self._light_bright_spin.setValue(max(1, min(100, br)))
+        except (TypeError, ValueError):
+            pass
+        self._light_debug_cb.setChecked(self._light_truthy_env("NSP_LIGHT_SEND_DEBUG"))
+        rp = (os.environ.get("NSP_LIGHT_AUTO_RULES_PATH") or "").strip()
+        if rp:
+            self._light_rules_path_le.setText(rp)
+        il = (os.environ.get("NSP_LIGHT_INTENT_LOG") or "").strip()
+        if il:
+            self._light_intent_log_le.setText(il)
+        fade = getattr(self, "_light_fade_ms_spin", None)
+        if fade is not None:
             try:
-                return int(prof.get(pkey, default))
+                fmv = int(float(str(os.environ.get("NSP_LIGHT_BLE_FADE_MS") or "0").strip()))
+                fade.setValue(max(0, min(10000, fmv)))
             except (TypeError, ValueError):
-                return default
+                pass
+        pulse = getattr(self, "_light_pulse_hz_spin", None)
+        if pulse is not None:
+            try:
+                ph = float(str(os.environ.get("NSP_LIGHT_BLE_PULSE_HZ") or "0").strip())
+                pulse.setValue(max(0.0, min(25.0, ph)))
+            except (TypeError, ValueError):
+                pass
+        fret = getattr(self, "_light_frame_retries_spin", None)
+        if fret is not None:
+            try:
+                fr = int(str(os.environ.get("NSP_LIGHT_BLE_FRAME_RETRIES") or "2").strip(), 0)
+                fret.setValue(max(1, min(10, fr)))
+            except (TypeError, ValueError):
+                pass
+        fdel = getattr(self, "_light_frame_retry_delay_spin", None)
+        if fdel is not None:
+            try:
+                fd = float(str(os.environ.get("NSP_LIGHT_BLE_FRAME_RETRY_DELAY_S") or "0.15").strip())
+                fdel.setValue(max(0.0, min(3.0, fd)))
+            except (TypeError, ValueError):
+                pass
+        fm = getattr(self, "_light_fade_max_steps_spin", None)
+        if fm is not None:
+            try:
+                v = int(str(os.environ.get("NSP_LIGHT_BLE_FADE_MAX_STEPS") or "32").strip(), 0)
+                fm.setValue(max(2, min(64, v)))
+            except (TypeError, ValueError):
+                pass
+        fms = getattr(self, "_light_fade_min_step_spin", None)
+        if fms is not None:
+            try:
+                v = float(str(os.environ.get("NSP_LIGHT_BLE_FADE_MIN_STEP_S") or "0").strip())
+                fms.setValue(max(0.0, min(3.0, v)))
+            except (TypeError, ValueError):
+                pass
+        fri = getattr(self, "_light_fade_respect_min_iv_cb", None)
+        if fri is not None:
+            fri.setChecked(self._light_truthy_env("NSP_LIGHT_BLE_FADE_RESPECT_MIN_INTERVAL"))
+        rdb = getattr(self, "_light_ble_retry_debug_cb", None)
+        if rdb is not None:
+            rdb.setChecked(self._light_truthy_env("NSP_LIGHT_BLE_RETRY_DEBUG"))
+        self._sync_tone_bin_rgb_widgets_from_env()
 
-        self._light_enable_cb.setChecked(_env_bool("NSP_LIGHT_ENABLED", "light_enabled", False))
-        self._light_set_combo_by_data(self._light_mode_cb, _env_str("NSP_LIGHT_MODE", "light_mode", "auto"))
-        self._light_send_cb.setChecked(_env_bool("NSP_LIGHT_SEND_ENABLED", "light_send_enabled", False))
-        self._light_set_combo_by_data(self._light_send_mode_cb, _env_str("NSP_LIGHT_SEND_MODE", "light_send_mode", "ble"))
-        self._light_set_combo_by_data(
-            self._light_proto_cb, _env_str("NSP_LIGHT_BLE_PROTOCOL", "light_ble_protocol", "ipixel_png")
+    def _set_rgb_spin_triplet(
+        self,
+        sr: QSpinBox,
+        sg: QSpinBox,
+        sb: QSpinBox,
+        env_key: str,
+        default: tuple[int, int, int],
+    ) -> None:
+        t = parse_rgb_csv_env(env_key, default)
+        sr.setValue(int(t[0]))
+        sg.setValue(int(t[1]))
+        sb.setValue(int(t[2]))
+
+    def _sync_tone_bin_rgb_widgets_from_env(self) -> None:
+        if getattr(self, "_vl_med_hi_r", None) is None:
+            return
+        self._set_rgb_spin_triplet(
+            self._vl_med_hi_r,
+            self._vl_med_hi_g,
+            self._vl_med_hi_b,
+            "NSP_LIGHT_VOL_LIGHT_MED_ABOVE_RGB",
+            (100, 150, 255),
         )
-        addr = _env_str("NSP_LIGHT_BLE_ADDRESS", "light_ble_address", "")
-        self._light_addr_le.setText(addr)
-        self._light_w_spin.setValue(_env_int("NSP_LIGHT_BLE_MATRIX_W", "light_matrix_w", 32))
-        self._light_h_spin.setValue(_env_int("NSP_LIGHT_BLE_MATRIX_H", "light_matrix_h", 16))
-        self._light_brightness_spin.setValue(_env_int("NSP_LIGHT_BLE_IPX_BRIGHTNESS", "light_ble_brightness", 80))
-        self._light_dry_cb.setChecked(_env_bool("NSP_LIGHT_BLE_DRY_RUN", "light_ble_dry_run", True))
-        self._light_ipx_init_cb.setChecked(_env_bool("NSP_LIGHT_BLE_IPX_INIT", "light_ble_ipx_init", True))
+        self._set_rgb_spin_triplet(
+            self._vl_med_lo_r,
+            self._vl_med_lo_g,
+            self._vl_med_lo_b,
+            "NSP_LIGHT_VOL_LIGHT_MED_BELOW_RGB",
+            (24, 28, 36),
+        )
+        self._set_rgb_spin_triplet(
+            self._vl_att_hi_r,
+            self._vl_att_hi_g,
+            self._vl_att_hi_b,
+            "NSP_LIGHT_VOL_LIGHT_ATT_ABOVE_RGB",
+            (255, 255, 200),
+        )
+        self._set_rgb_spin_triplet(
+            self._vl_att_lo_r,
+            self._vl_att_lo_g,
+            self._vl_att_lo_b,
+            "NSP_LIGHT_VOL_LIGHT_ATT_BELOW_RGB",
+            (24, 28, 36),
+        )
+        if getattr(self, "_bin_ph_a_r", None) is None:
+            return
+        self._set_rgb_spin_triplet(
+            self._bin_ph_a_r,
+            self._bin_ph_a_g,
+            self._bin_ph_a_b,
+            "NSP_LIGHT_BIN_PULSE_RGB_A",
+            (100, 150, 255),
+        )
+        self._set_rgb_spin_triplet(
+            self._bin_ph_b_r,
+            self._bin_ph_b_g,
+            self._bin_ph_b_b,
+            "NSP_LIGHT_BIN_PULSE_RGB_B",
+            (24, 28, 36),
+        )
 
-    def _light_sync_env_from_widgets(self) -> None:
-        os.environ["NSP_LIGHT_ENABLED"] = "1" if self._light_enable_cb.isChecked() else "0"
-        os.environ["NSP_LIGHT_MODE"] = str(self._light_mode_cb.currentData() or "auto")
+    def _csv_rgb_from_spins(self, sr: QSpinBox, sg: QSpinBox, sb: QSpinBox) -> str:
+        return f"{int(sr.value())},{int(sg.value())},{int(sb.value())}"
+
+    def _tone_bin_rgb_env_from_widgets(self) -> None:
+        if getattr(self, "_vl_med_hi_r", None) is None:
+            return
+        os.environ["NSP_LIGHT_VOL_LIGHT_MED_ABOVE_RGB"] = self._csv_rgb_from_spins(
+            self._vl_med_hi_r, self._vl_med_hi_g, self._vl_med_hi_b
+        )
+        os.environ["NSP_LIGHT_VOL_LIGHT_MED_BELOW_RGB"] = self._csv_rgb_from_spins(
+            self._vl_med_lo_r, self._vl_med_lo_g, self._vl_med_lo_b
+        )
+        os.environ["NSP_LIGHT_VOL_LIGHT_ATT_ABOVE_RGB"] = self._csv_rgb_from_spins(
+            self._vl_att_hi_r, self._vl_att_hi_g, self._vl_att_hi_b
+        )
+        os.environ["NSP_LIGHT_VOL_LIGHT_ATT_BELOW_RGB"] = self._csv_rgb_from_spins(
+            self._vl_att_lo_r, self._vl_att_lo_g, self._vl_att_lo_b
+        )
+        if getattr(self, "_bin_ph_a_r", None) is None:
+            return
+        os.environ["NSP_LIGHT_BIN_PULSE_RGB_A"] = self._csv_rgb_from_spins(
+            self._bin_ph_a_r, self._bin_ph_a_g, self._bin_ph_a_b
+        )
+        os.environ["NSP_LIGHT_BIN_PULSE_RGB_B"] = self._csv_rgb_from_spins(
+            self._bin_ph_b_r, self._bin_ph_b_g, self._bin_ph_b_b
+        )
+
+    def _light_overlay_profile_widgets(self) -> None:
+        try:
+            data = load_ui_profile(resolved_profile_path())
+            lu = data.get("light_ui")
+            if not isinstance(lu, dict):
+                return
+            if "metrics" in lu:
+                self._light_metrics_cb.setChecked(bool(lu["metrics"]))
+            if lu.get("mode") in ("auto", "log"):
+                self._set_light_combo(self._light_mode_cb, str(lu["mode"]))
+            if "send" in lu:
+                self._light_send_cb.setChecked(bool(lu["send"]))
+            if lu.get("send_mode") in ("log", "ble"):
+                self._set_light_combo(self._light_send_mode_cb, str(lu["send_mode"]))
+            if lu.get("protocol") in ("raw", "ipixel_png"):
+                self._set_light_combo(self._light_proto_cb, str(lu["protocol"]))
+            mac = str(lu.get("matrix_mac") or "").strip()
+            if mac:
+                self._light_mac_le.setText(mac)
+            try:
+                if "matrix_w" in lu:
+                    self._light_w_spin.setValue(max(8, min(512, int(lu["matrix_w"]))))
+                if "matrix_h" in lu:
+                    self._light_h_spin.setValue(max(8, min(512, int(lu["matrix_h"]))))
+            except (TypeError, ValueError):
+                pass
+            if "dry_run" in lu:
+                self._light_dry_cb.setChecked(bool(lu["dry_run"]))
+            try:
+                if "brightness" in lu:
+                    self._light_bright_spin.setValue(max(1, min(100, int(lu["brightness"]))))
+            except (TypeError, ValueError):
+                pass
+            if "send_debug" in lu:
+                self._light_debug_cb.setChecked(bool(lu["send_debug"]))
+            if "manual_hold" in lu:
+                self._light_manual_hold_cb.setChecked(bool(lu["manual_hold"]))
+            try:
+                if "manual_r" in lu:
+                    self._light_manual_r.setValue(max(0, min(255, int(lu["manual_r"]))))
+                if "manual_g" in lu:
+                    self._light_manual_g.setValue(max(0, min(255, int(lu["manual_g"]))))
+                if "manual_b" in lu:
+                    self._light_manual_b.setValue(max(0, min(255, int(lu["manual_b"]))))
+            except (TypeError, ValueError):
+                pass
+            if "auto_rules_path" in lu:
+                self._light_rules_path_le.setText(str(lu.get("auto_rules_path") or "").strip())
+            if "intent_log_path" in lu:
+                self._light_intent_log_le.setText(str(lu.get("intent_log_path") or "").strip())
+            if getattr(self, "_vl_med_hi_r", None) is not None:
+                try:
+
+                    def _tri(lu2: dict[str, Any], k: str) -> tuple[int, int, int] | None:
+                        v = lu2.get(k)
+                        if not isinstance(v, (list, tuple)) or len(v) != 3:
+                            return None
+                        return (
+                            max(0, min(255, int(v[0]))),
+                            max(0, min(255, int(v[1]))),
+                            max(0, min(255, int(v[2]))),
+                        )
+
+                    t = _tri(lu, "vol_light_med_hi")
+                    if t is not None:
+                        self._vl_med_hi_r.setValue(t[0])
+                        self._vl_med_hi_g.setValue(t[1])
+                        self._vl_med_hi_b.setValue(t[2])
+                    t = _tri(lu, "vol_light_med_lo")
+                    if t is not None:
+                        self._vl_med_lo_r.setValue(t[0])
+                        self._vl_med_lo_g.setValue(t[1])
+                        self._vl_med_lo_b.setValue(t[2])
+                    t = _tri(lu, "vol_light_att_hi")
+                    if t is not None:
+                        self._vl_att_hi_r.setValue(t[0])
+                        self._vl_att_hi_g.setValue(t[1])
+                        self._vl_att_hi_b.setValue(t[2])
+                    t = _tri(lu, "vol_light_att_lo")
+                    if t is not None:
+                        self._vl_att_lo_r.setValue(t[0])
+                        self._vl_att_lo_g.setValue(t[1])
+                        self._vl_att_lo_b.setValue(t[2])
+                    t = _tri(lu, "bin_pulse_a")
+                    if t is not None:
+                        self._bin_ph_a_r.setValue(t[0])
+                        self._bin_ph_a_g.setValue(t[1])
+                        self._bin_ph_a_b.setValue(t[2])
+                    t = _tri(lu, "bin_pulse_b")
+                    if t is not None:
+                        self._bin_ph_b_r.setValue(t[0])
+                        self._bin_ph_b_g.setValue(t[1])
+                        self._bin_ph_b_b.setValue(t[2])
+                except (TypeError, ValueError):
+                    pass
+            fade = getattr(self, "_light_fade_ms_spin", None)
+            pulse = getattr(self, "_light_pulse_hz_spin", None)
+            fret = getattr(self, "_light_frame_retries_spin", None)
+            fdel = getattr(self, "_light_frame_retry_delay_spin", None)
+            try:
+                if fade is not None and "ble_fade_ms" in lu:
+                    fade.setValue(max(0, min(10000, int(lu["ble_fade_ms"]))))
+                if pulse is not None and "ble_pulse_hz" in lu:
+                    pulse.setValue(max(0.0, min(25.0, float(lu["ble_pulse_hz"]))))
+                if fret is not None and "ble_frame_retries" in lu:
+                    fret.setValue(max(1, min(10, int(lu["ble_frame_retries"]))))
+                if fdel is not None and "ble_frame_retry_delay_s" in lu:
+                    fdel.setValue(max(0.0, min(3.0, float(lu["ble_frame_retry_delay_s"]))))
+                fm = getattr(self, "_light_fade_max_steps_spin", None)
+                fms = getattr(self, "_light_fade_min_step_spin", None)
+                fri = getattr(self, "_light_fade_respect_min_iv_cb", None)
+                rdb = getattr(self, "_light_ble_retry_debug_cb", None)
+                if fm is not None and "ble_fade_max_steps" in lu:
+                    fm.setValue(max(2, min(64, int(lu["ble_fade_max_steps"]))))
+                if fms is not None and "ble_fade_min_step_s" in lu:
+                    fms.setValue(max(0.0, min(3.0, float(lu["ble_fade_min_step_s"]))))
+                if fri is not None and "ble_fade_respect_min_interval" in lu:
+                    fri.setChecked(bool(lu["ble_fade_respect_min_interval"]))
+                if rdb is not None and "ble_retry_debug" in lu:
+                    rdb.setChecked(bool(lu["ble_retry_debug"]))
+            except (TypeError, ValueError):
+                pass
+        except Exception:
+            pass
+
+    def _sync_light_env_from_ui(self) -> None:
+        os.environ["NSP_LIGHT_ENABLED"] = "1" if self._light_metrics_cb.isChecked() else "0"
+        os.environ["NSP_LIGHT_MODE"] = str(self._light_mode_cb.currentData())
         os.environ["NSP_LIGHT_SEND_ENABLED"] = "1" if self._light_send_cb.isChecked() else "0"
-        os.environ["NSP_LIGHT_SEND_MODE"] = str(self._light_send_mode_cb.currentData() or "ble")
-        os.environ["NSP_LIGHT_BLE_PROTOCOL"] = str(self._light_proto_cb.currentData() or "raw")
-        addr = self._light_addr_le.text().strip()
-        if addr:
-            os.environ["NSP_LIGHT_BLE_ADDRESS"] = normalize_ble_address(addr)
-        else:
-            os.environ["NSP_LIGHT_BLE_ADDRESS"] = ""
+        os.environ["NSP_LIGHT_SEND_MODE"] = str(self._light_send_mode_cb.currentData())
+        os.environ["NSP_LIGHT_BLE_PROTOCOL"] = str(self._light_proto_cb.currentData())
+        os.environ["NSP_LIGHT_BLE_ADDRESS"] = self._light_mac_le.text().strip()
         os.environ["NSP_LIGHT_BLE_MATRIX_W"] = str(int(self._light_w_spin.value()))
         os.environ["NSP_LIGHT_BLE_MATRIX_H"] = str(int(self._light_h_spin.value()))
-        os.environ["NSP_LIGHT_BLE_IPX_BRIGHTNESS"] = str(int(self._light_brightness_spin.value()))
         os.environ["NSP_LIGHT_BLE_DRY_RUN"] = "1" if self._light_dry_cb.isChecked() else "0"
-        os.environ["NSP_LIGHT_BLE_IPX_INIT"] = "1" if self._light_ipx_init_cb.isChecked() else "0"
+        os.environ["NSP_LIGHT_BLE_IPX_BRIGHTNESS"] = str(int(self._light_bright_spin.value()))
+        os.environ["NSP_LIGHT_SEND_DEBUG"] = "1" if self._light_debug_cb.isChecked() else "0"
+        os.environ["NSP_LIGHT_AUTO_RULES_PATH"] = self._light_rules_path_le.text().strip()
+        os.environ["NSP_LIGHT_INTENT_LOG"] = self._light_intent_log_le.text().strip()
+        fade = getattr(self, "_light_fade_ms_spin", None)
+        if fade is not None:
+            os.environ["NSP_LIGHT_BLE_FADE_MS"] = str(int(fade.value()))
+        pulse = getattr(self, "_light_pulse_hz_spin", None)
+        if pulse is not None:
+            os.environ["NSP_LIGHT_BLE_PULSE_HZ"] = str(float(pulse.value()))
+        fret = getattr(self, "_light_frame_retries_spin", None)
+        if fret is not None:
+            os.environ["NSP_LIGHT_BLE_FRAME_RETRIES"] = str(int(fret.value()))
+        fdel = getattr(self, "_light_frame_retry_delay_spin", None)
+        if fdel is not None:
+            os.environ["NSP_LIGHT_BLE_FRAME_RETRY_DELAY_S"] = str(float(fdel.value()))
+        fm = getattr(self, "_light_fade_max_steps_spin", None)
+        if fm is not None:
+            os.environ["NSP_LIGHT_BLE_FADE_MAX_STEPS"] = str(int(fm.value()))
+        fms = getattr(self, "_light_fade_min_step_spin", None)
+        if fms is not None:
+            os.environ["NSP_LIGHT_BLE_FADE_MIN_STEP_S"] = str(float(fms.value()))
+        fri = getattr(self, "_light_fade_respect_min_iv_cb", None)
+        if fri is not None:
+            os.environ["NSP_LIGHT_BLE_FADE_RESPECT_MIN_INTERVAL"] = "1" if fri.isChecked() else "0"
+        rdb = getattr(self, "_light_ble_retry_debug_cb", None)
+        if rdb is not None:
+            os.environ["NSP_LIGHT_BLE_RETRY_DEBUG"] = "1" if rdb.isChecked() else "0"
+        self._tone_bin_rgb_env_from_widgets()
 
-    def _reattach_light_bridges(self) -> None:
-        if getattr(self, "_light_send_detach", None) is not None:
+    def _reload_light_bridges(self) -> None:
+        from neurosync_pro.light import auto_rules as auto_rules_mod
+
+        auto_rules_mod._rules_file_cache = None  # noqa: SLF001
+        if self._light_send_detach is not None:
             try:
                 self._light_send_detach()
             except Exception:
                 pass
             self._light_send_detach = None
-        if getattr(self, "_light_bridge_detach", None) is not None:
+        if self._light_bridge_detach is not None:
             try:
                 self._light_bridge_detach()
             except Exception:
                 pass
             self._light_bridge_detach = None
-        self._light_sync_env_from_widgets()
+        self._sync_light_env_from_ui()
         self._light_bridge_detach = try_attach_metrics_light_bridge(self._bus)
         self._light_send_detach = try_attach_light_intent_sink(self._bus)
+        self._republish_eeg_tone_volume_light_if_active()
 
-    def _light_apply_clicked(self) -> None:
-        self._reattach_light_bridges()
-        if hasattr(self, "_status"):
-            self._status.setText("Свет: настройки применены")
+    def _light_manual_preset_changed(self, _idx: int) -> None:
+        data = self._light_manual_preset_cb.currentData()
+        if data is None:
+            return
+        self._light_manual_preset_cb.blockSignals(True)
+        try:
+            if data == "idle":
+                self._light_manual_r.setValue(24)
+                self._light_manual_g.setValue(28)
+                self._light_manual_b.setValue(36)
+            elif data == "calm":
+                self._light_manual_r.setValue(100)
+                self._light_manual_g.setValue(150)
+                self._light_manual_b.setValue(255)
+            elif data == "focus":
+                self._light_manual_r.setValue(255)
+                self._light_manual_g.setValue(255)
+                self._light_manual_b.setValue(200)
+            self._light_manual_preset_cb.setCurrentIndex(0)
+        finally:
+            self._light_manual_preset_cb.blockSignals(False)
+
+    def _schedule_light_brightness_apply(self, _v: int) -> None:
+        self._light_brightness_apply_timer.start()
+
+    def _apply_light_brightness_to_env_and_ble(self) -> None:
+        self._sync_light_env_from_ui()
+        try:
+            self._bus.publish("light.env_updated", {})
+        except Exception:
+            pass
 
     def _chat_metric_loop_interval_ms_default(self) -> int:
         raw = os.environ.get("NSP_CHAT_METRIC_LOOP_S", "30")
@@ -3646,6 +4346,15 @@ class MeditationMainWindow(QMainWindow):
         else:
             self._tone_axis_y_vol.setRange(0, min(1.0, max(hi_v * 1.1, 0.02)))
 
+    def _session_metrics_source_label(self) -> str:
+        if self._ble_thread is not None:
+            return "ble"
+        if self._tgam_com_thread is not None:
+            return "tgam_com"
+        if self._eeg_it is not None:
+            return "jsonl"
+        return "ui"
+
     def _append_session_log(self, att: int, med: int) -> None:
         self._write_event(
             "eeg",
@@ -3679,7 +4388,7 @@ class MeditationMainWindow(QMainWindow):
             "session_id": str(self._session_id),
             "timestamp_utc": datetime.now(UTC).isoformat(),
             "t_monotonic_s": float(time.monotonic() - float(self._session_t0_mono)),
-            "source": "ble" if self._ble_thread is not None else ("jsonl" if self._eeg_it is not None else "ui"),
+            "source": self._session_metrics_source_label(),
         }
         rec.update(payload or {})
         fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -3714,6 +4423,9 @@ class MeditationMainWindow(QMainWindow):
 
     def _start_ble(self) -> None:
         if not self._ble_address or self._ble_thread is not None:
+            return
+        if self._tgam_com_thread is not None:
+            self._status.setText("Остановите TGAM COM перед стартом BLE")
             return
         self._status.setText("BLE: подключение…")
         self._ble_start.setEnabled(False)
@@ -3752,6 +4464,63 @@ class MeditationMainWindow(QMainWindow):
         th.start()
         self._rssi_timer.start()
 
+    def _start_tgam_com(self) -> None:
+        if self._tgam_com_thread is not None:
+            return
+        if self._ble_thread is not None:
+            self._status.setText("Остановите BLE перед стартом TGAM COM")
+            return
+        port = self._tgam_com_port_le.text().strip()
+        if not port:
+            port = "COM3"
+        baud = int(self._tgam_com_baud_spin.value())
+        os.environ["NSP_TGAM_COM_PORT"] = port
+        os.environ["NSP_TGAM_COM_BAUD"] = str(baud)
+        self._status.setText("TGAM COM: подключение…")
+        self._tgam_com_start_btn.setEnabled(False)
+        self._tgam_com_stop_btn.setEnabled(True)
+        if self._session_started_at is None:
+            self._session_started_at = time.monotonic()
+        if self._session_t0_mono is None:
+            self._session_t0_mono = time.monotonic()
+        self._write_session_start()
+        if self._session_log_active:
+            self._obs_timer.start()
+        qc = Qt.ConnectionType.QueuedConnection
+        th = TgamComMetricsThread(port=port, baud=baud, parent=self)
+        th.metricsReady.connect(self._on_tgam_com_metrics, qc)
+        th.signalQualityReady.connect(self._on_tgam_com_signal_quality, qc)
+        th.connectionFailed.connect(self._on_tgam_com_failed, qc)
+        th.workerFinished.connect(self._on_tgam_com_worker_finished, qc)
+        self._tgam_com_thread = th
+        th.start()
+
+    def _stop_tgam_com(self) -> None:
+        if self._tgam_com_thread is not None:
+            self._tgam_com_thread.request_stop()
+            self._status.setText("TGAM COM: остановка…")
+
+    def _on_tgam_com_metrics(self, att: int, med: int) -> None:
+        self._ingest_live_eeg_metrics(att, med)
+        if str(self._status.text()).startswith("TGAM COM: подключ"):
+            self._status.setText("TGAM COM: поток активен")
+
+    def _on_tgam_com_signal_quality(self, q: int) -> None:
+        self._on_ble_signal_quality(q)
+
+    def _on_tgam_com_failed(self, msg: str) -> None:
+        self._status.setText(f"TGAM COM ошибка: {msg}")
+
+    def _on_tgam_com_worker_finished(self) -> None:
+        self._tgam_com_thread = None
+        self._tgam_com_start_btn.setEnabled(True)
+        self._tgam_com_stop_btn.setEnabled(False)
+        if self._ble_thread is None and self._obs_timer.isActive():
+            self._obs_timer.stop()
+        st = str(self._status.text())
+        if not st.startswith("TGAM COM ошибка"):
+            self._status.setText("TGAM COM: отключено")
+
     def _stop_ble(self) -> None:
         if self._ble_thread is not None:
             self._ble_thread.request_stop()
@@ -3760,7 +4529,148 @@ class MeditationMainWindow(QMainWindow):
         if self._obs_timer.isActive():
             self._obs_timer.stop()
 
-    def _on_ble_metrics(self, att: int, med: int) -> None:
+    def _suppress_metrics_auto_light_on_metrics_publish(self) -> bool:
+        bin_cb = getattr(self, "_bin_matrix_pulse_cb", None)
+        hold_cb = getattr(self, "_light_manual_hold_cb", None)
+        return should_skip_metrics_auto_light_for_aux_sources(
+            eeg_tone_enabled=self._eeg_tone_enabled,
+            eeg_tone_mode=str(self._eeg_tone_mode),
+            eeg_tone_vol_src=str(self._eeg_tone_vol_src),
+            eeg_bin_enabled=bool(self._eeg_bin_enabled),
+            bin_matrix_pulse_checked=bool(bin_cb is not None and bin_cb.isChecked()),
+            light_manual_hold_checked=bool(hold_cb is not None and hold_cb.isChecked()),
+        )
+
+    def _light_manual_apply_clicked(self) -> None:
+        r = int(self._light_manual_r.value())
+        g = int(self._light_manual_g.value())
+        b = int(self._light_manual_b.value())
+        now = time.monotonic()
+        try:
+            self._bus.publish(
+                "light.intent",
+                {
+                    "kind": "rgb",
+                    "rgb": [r, g, b],
+                    "attention": float(self._last_att),
+                    "meditation": float(self._last_med),
+                    "t_monotonic_s": now,
+                    "source": "light_manual",
+                },
+            )
+        except Exception:
+            pass
+
+    def _ble_light_min_interval_s(self) -> float:
+        raw = os.environ.get("NSP_LIGHT_BLE_MIN_INTERVAL_S")
+        if raw is None or str(raw).strip() == "":
+            return 0.05
+        try:
+            return float(str(raw).strip())
+        except ValueError:
+            return 0.05
+
+    def _bin_matrix_pulse_interval_ms(self) -> float:
+        ph = pulse_hz_from_carrier(
+            float(self._eeg_bin_base_hz),
+            float(self._eeg_bin_base_min_hz),
+            float(self._eeg_bin_base_max_hz),
+            float(self._eeg_bin_matrix_pulse_hz_lo),
+            float(self._eeg_bin_matrix_pulse_hz_hi),
+        )
+        return half_period_ms_from_pulse_hz(ph, ble_min_interval_s=self._ble_light_min_interval_s())
+
+    def _stop_bin_matrix_pulse_timer(self) -> None:
+        t = getattr(self, "_bin_matrix_pulse_timer", None)
+        if t is not None and t.isActive():
+            t.stop()
+
+    def _publish_light_intent_bin_pulse(self, rgb: tuple[int, int, int]) -> None:
+        now = time.monotonic()
+        try:
+            self._bus.publish(
+                "light.intent",
+                {
+                    "kind": "rgb",
+                    "rgb": [int(rgb[0]), int(rgb[1]), int(rgb[2])],
+                    "attention": float(self._last_att),
+                    "meditation": float(self._last_med),
+                    "t_monotonic_s": now,
+                    "source": "eeg_bin_matrix_pulse",
+                },
+            )
+        except Exception:
+            pass
+
+    def _on_bin_matrix_pulse_tick(self) -> None:
+        if not self._eeg_bin_enabled or not self._bin_matrix_pulse_cb.isChecked():
+            self._stop_bin_matrix_pulse_timer()
+            return
+        self._bin_matrix_pulse_phase = not self._bin_matrix_pulse_phase
+        if getattr(self, "_bin_ph_a_r", None) is not None:
+            if self._bin_matrix_pulse_phase:
+                rgb = (
+                    int(self._bin_ph_a_r.value()),
+                    int(self._bin_ph_a_g.value()),
+                    int(self._bin_ph_a_b.value()),
+                )
+            else:
+                rgb = (
+                    int(self._bin_ph_b_r.value()),
+                    int(self._bin_ph_b_g.value()),
+                    int(self._bin_ph_b_b.value()),
+                )
+        else:
+            rgb = (100, 150, 255) if self._bin_matrix_pulse_phase else (24, 28, 36)
+        self._publish_light_intent_bin_pulse(rgb)
+        iv_ms = int(self._bin_matrix_pulse_interval_ms())
+        self._bin_matrix_pulse_timer.setInterval(max(20, iv_ms))
+
+    def _bin_matrix_pulse_toggled(self, on: bool) -> None:
+        if not on:
+            self._stop_bin_matrix_pulse_timer()
+            return
+        if self._eeg_bin_enabled:
+            iv_ms = int(self._bin_matrix_pulse_interval_ms())
+            self._bin_matrix_pulse_timer.setInterval(max(20, iv_ms))
+            if not self._bin_matrix_pulse_timer.isActive():
+                self._bin_matrix_pulse_timer.start()
+
+    def _bin_pulse_hz_bounds_changed(self, _v: float) -> None:
+        self._eeg_bin_matrix_pulse_hz_lo = float(self._bin_pulse_hz_min.value())
+        self._eeg_bin_matrix_pulse_hz_hi = float(self._bin_pulse_hz_max.value())
+
+    def _publish_light_intent_for_tone_volume_light(self, rgb: tuple[int, int, int]) -> None:
+        now = time.monotonic()
+        try:
+            self._bus.publish(
+                "light.intent",
+                {
+                    "kind": "rgb",
+                    "rgb": [int(rgb[0]), int(rgb[1]), int(rgb[2])],
+                    "attention": float(self._last_att),
+                    "meditation": float(self._last_med),
+                    "t_monotonic_s": now,
+                    "source": "eeg_tone_volume_light",
+                },
+            )
+        except Exception:
+            pass
+
+    def _republish_eeg_tone_volume_light_if_active(self) -> None:
+        if not self._eeg_tone_enabled or self._eeg_tone_mode != "mono":
+            return
+        if self._eeg_tone_vol_src not in ("meditation_light", "attention_light"):
+            return
+        med = max(0.0, min(1.0, float(self._last_med) / 100.0))
+        att = max(0.0, min(1.0, float(self._last_att) / 100.0))
+        if self._eeg_tone_vol_src == "meditation_light":
+            rgb = rgb_meditation_volume_light(med)
+        else:
+            rgb = rgb_attention_volume_light(att)
+        self._publish_light_intent_for_tone_volume_light(rgb)
+
+    def _ingest_live_eeg_metrics(self, att: int, med: int) -> None:
         now = time.monotonic()
         self._last_metric_at = now
         self._metric_times.append(now)
@@ -3773,7 +4683,14 @@ class MeditationMainWindow(QMainWindow):
         self._last_med = med
         self._att_val.setText(f"Attention {int(att)}")
         self._med_val.setText(f"Meditation {int(med)}")
-        self._bus.publish("eeg.metrics", {"attention": att, "meditation": med})
+        skip_auto = self._suppress_metrics_auto_light_on_metrics_publish()
+        if skip_auto:
+            os.environ["NSP_LIGHT_SKIP_AUTO_LIGHT"] = "1"
+        try:
+            self._bus.publish("eeg.metrics", {"attention": att, "meditation": med})
+        finally:
+            if skip_auto:
+                os.environ.pop("NSP_LIGHT_SKIP_AUTO_LIGHT", None)
         self._append_session_log(att, med)
         self._obs_points.append(
             {
@@ -3789,6 +4706,9 @@ class MeditationMainWindow(QMainWindow):
         self._append_plot_point(att, med)
         self._apply_eeg_tone()
         self._apply_eeg_binaural()
+
+    def _on_ble_metrics(self, att: int, med: int) -> None:
+        self._ingest_live_eeg_metrics(att, med)
         if self._status.text().startswith("BLE: подключение"):
             self._status.setText("BLE: поток активен")
 
@@ -3881,6 +4801,8 @@ class MeditationMainWindow(QMainWindow):
         self._ble_start.setEnabled(True)
         self._ble_stop.setEnabled(False)
         self._rssi_timer.stop()
+        if self._obs_timer.isActive() and self._tgam_com_thread is None:
+            self._obs_timer.stop()
         if not str(self._status.text()).startswith("BLE ошибка"):
             self._status.setText("BLE: отключено")
 
@@ -3894,6 +4816,8 @@ class MeditationMainWindow(QMainWindow):
                 self._api_server = None
             if self._ble_thread and self._ble_thread.isRunning():
                 self._status.setText("BLE: поток активен")
+            elif self._tgam_com_thread is not None:
+                self._status.setText("TGAM COM: поток активен")
             else:
                 self._status.setText("API выключен")
 
@@ -3914,7 +4838,14 @@ class MeditationMainWindow(QMainWindow):
         self._last_med = med
         self._att_val.setText(f"Attention {int(att)}")
         self._med_val.setText(f"Meditation {int(med)}")
-        self._bus.publish("eeg.metrics", {"attention": att, "meditation": med})
+        skip_auto = self._suppress_metrics_auto_light_on_metrics_publish()
+        if skip_auto:
+            os.environ["NSP_LIGHT_SKIP_AUTO_LIGHT"] = "1"
+        try:
+            self._bus.publish("eeg.metrics", {"attention": att, "meditation": med})
+        finally:
+            if skip_auto:
+                os.environ.pop("NSP_LIGHT_SKIP_AUTO_LIGHT", None)
         self._append_session_log(att, med)
         self._append_plot_point(att, med)
         self._apply_eeg_tone()
@@ -3956,6 +4887,10 @@ class MeditationMainWindow(QMainWindow):
             self._ble_thread.request_stop()
             self._ble_thread.wait(8000)
             self._ble_thread = None
+        if self._tgam_com_thread is not None:
+            self._tgam_com_thread.request_stop()
+            self._tgam_com_thread.wait(8000)
+            self._tgam_com_thread = None
         self._stop_etalon_com_thread_blocking()
         if self._api_server is not None:
             stop_agent_api(self._api_server)
@@ -3970,7 +4905,7 @@ class MeditationMainWindow(QMainWindow):
             self._chat_worker = None
         try:
             self._chat_save_profile()
-        except OSError:
+        except Exception:
             pass
         if self._session_log_file is not None:
             try:
@@ -4252,9 +5187,21 @@ class MeditationMainWindow(QMainWindow):
 
         if self._eeg_tone_vol_src == "off":
             target_v = float(self._eeg_tone_fixed_vol)
+            tone_extra = ""
+        elif self._eeg_tone_vol_src == "meditation_light":
+            target_v = self._eeg_tone_min_vol + (self._eeg_tone_max_vol - self._eeg_tone_min_vol) * med
+            rgb = rgb_meditation_volume_light(med)
+            self._publish_light_intent_for_tone_volume_light(rgb)
+            tone_extra = f"  RGB{rgb}"
+        elif self._eeg_tone_vol_src == "attention_light":
+            target_v = self._eeg_tone_min_vol + (self._eeg_tone_max_vol - self._eeg_tone_min_vol) * att
+            rgb = rgb_attention_volume_light(att)
+            self._publish_light_intent_for_tone_volume_light(rgb)
+            tone_extra = f"  RGB{rgb}"
         else:
             vol_src = med if self._eeg_tone_vol_src == "meditation" else att
             target_v = self._eeg_tone_min_vol + (self._eeg_tone_max_vol - self._eeg_tone_min_vol) * vol_src
+            tone_extra = ""
 
         self._eeg_tone_f_hz = (1.0 - a) * self._eeg_tone_f_hz + a * target_f
         self._eeg_tone_vol = (1.0 - a) * self._eeg_tone_vol + a * target_v
@@ -4264,9 +5211,9 @@ class MeditationMainWindow(QMainWindow):
         self._eeg_tone_stream.set_volume(float(self._eeg_tone_vol))
         self._eeg_tone_stream.play_tone(float(self._eeg_tone_f_hz))
         self._genmon_line.setText(
-            f"EEG→Tone(mono) f={self._eeg_tone_f_hz:.1f}Hz  v={self._eeg_tone_vol:.3f}"
+            f"EEG→Tone(mono) f={self._eeg_tone_f_hz:.1f}Hz  v={self._eeg_tone_vol:.3f}{tone_extra}"
         )
-        self._set_tone_base_text(f"mono  f={self._eeg_tone_f_hz:.1f}Hz  v={self._eeg_tone_vol:.3f}")
+        self._set_tone_base_text(f"mono  f={self._eeg_tone_f_hz:.1f}Hz  v={self._eeg_tone_vol:.3f}{tone_extra}")
         self._append_tone_plot_sample()
 
     def _apply_eeg_binaural(self) -> None:
@@ -4304,6 +5251,11 @@ class MeditationMainWindow(QMainWindow):
         self._genmon_line.setText(
             f"EEG→Binaural fL={left:.1f}Hz fR={right:.1f}Hz  Δf={float(self._eeg_bin_delta_hz):.2f}Hz  v={float(self._eeg_bin_fixed_vol):.3f}"
         )
+        if self._bin_matrix_pulse_cb.isChecked():
+            iv_ms = int(self._bin_matrix_pulse_interval_ms())
+            self._bin_matrix_pulse_timer.setInterval(max(20, iv_ms))
+            if not self._bin_matrix_pulse_timer.isActive():
+                self._bin_matrix_pulse_timer.start()
 
 
 def run_meditation_poc(
